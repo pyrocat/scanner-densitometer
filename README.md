@@ -5,8 +5,12 @@ Tkinter app for using a flatbed scanner as a practical densitometer surrogate wh
 The app does not talk to the scanner directly. It assumes the scan has already been made and saved as a 16-bit TIFF. The workflow is:
 
 1. Open a TIFF scan.
-2. Manually draw a rectangle over the step wedge on the scan.
-3. Let the app detect the 21 steps and build a density curve.
+2. Optionally draw a rectangle over a scan of the T2115 itself and click
+   **Calibrate from Selection**. This maps scanner signal to real density
+   using the wedge's known 0.05–3.05 D steps.
+3. Draw a rectangle edge to edge over the wedge image on the sample (negative
+   or print). The app divides it into 21 equal cells, because the T2115
+   geometry is fixed, measures the centre of each cell, and plots the curve.
 
 ## Why this approach
 
@@ -60,19 +64,22 @@ For this project, that becomes a simpler desktop workflow:
 
 ### Improvements over the manual workflows
 
-- Automatic 21-step boundary detection from one selection.
-- Immediate overlay of detected step boundaries on the scan.
-- Built-in curve plotting for relative log exposure versus measured density.
-- A relative mode and a full-scale mode for density reference handling.
+- Fixed 21-cell grid from one selection, overlaid on the scan so misalignment is visible.
+- Steps identified by position, with the strip direction detected automatically.
+- Built-in curve plotting for relative log exposure versus measured density, with per-step noise bars.
+- A relative mode (density above the brightest step) and a calibrated mode built from a scan of the wedge.
+- Warnings for clipped steps and for samples darker than the calibration can resolve.
 - Testable logic separated from the Tkinter UI.
 
 ## Assumptions and limitations
 
-- Best results require a linear 16-bit TIFF with scanner corrections disabled.
+- Best results require a linear 16-bit TIFF with scanner corrections disabled. Calibrated mode also works with gamma-encoded scans, because the calibration absorbs any monotonic encoding.
 - The app supports grayscale TIFFs directly and also accepts RGB TIFFs by converting them to luminance.
-- The manually selected ROI should contain one complete 21-step strip with little extra background.
+- The selection must span the 21 steps edge to edge; the grid is not detected, only divided. Check the overlaid cell lines and the ±D column.
+- A calibration is only valid for scans made with the same scanner, light path (transmission or reflection), and locked exposure. Scanning the wedge alongside the sample is the safest workflow.
+- Calibrating with the T2115 covers transmission scans. Reflection prints get relative densities unless a reflection step tablet is used as the calibration target.
+- Relative mode assumes a linear scanner with no black offset, so it compresses high densities; treat it as approximate.
 - The plotted x-axis is relative log exposure derived from the T2115 spacing, not enlarger time in seconds.
-- Without scanner calibration against a reflective standard, absolute density should be treated as approximate.
 
 ## Run
 

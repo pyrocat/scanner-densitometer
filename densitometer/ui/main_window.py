@@ -7,14 +7,21 @@ from tkinter import filedialog, messagebox, ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from ..logic.analysis import analyze_selection
+from ..logic.analysis import analyze_selection, calibrate_from_wedge
 from ..logic.image_loader import load_image
-from ..logic.models import AnalysisResult, AnalysisSettings, LoadedImage, ReferenceMode, Selection
+from ..logic.models import (
+    AnalysisResult,
+    AnalysisSettings,
+    Calibration,
+    LoadedImage,
+    ReferenceMode,
+    Selection,
+)
 from .image_canvas import ImageCanvas
 
 REFERENCE_LABELS: dict[str, ReferenceMode] = {
-    "Relative to brightest step": "selection_max",
-    "Relative to 16-bit scanner white": "full_scale",
+    "Relative to brightest step": "relative",
+    "Calibrated from T2115 scan": "calibrated",
 }
 
 
@@ -24,6 +31,7 @@ class MainWindow(ttk.Frame):
         self._loaded_image: LoadedImage | None = None
         self._selection: Selection | None = None
         self._analysis_result: AnalysisResult | None = None
+        self._calibration: Calibration | None = None
 
         self.reference_label = tk.StringVar(value=next(iter(REFERENCE_LABELS)))
         self.status_text = tk.StringVar(
@@ -42,16 +50,23 @@ class MainWindow(ttk.Frame):
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(5, weight=1)
+        toolbar.columnconfigure(6, weight=1)
 
         ttk.Button(toolbar, text="Open TIFF...", command=self._open_file).grid(
             row=0, column=0, padx=(0, 8)
         )
         ttk.Label(toolbar, text="Density reference:").grid(row=0, column=1, padx=(0, 8))
+        self.calibrate_button = ttk.Button(
+            toolbar,
+            text="Calibrate from Selection",
+            command=self._calibrate,
+            state="disabled",
+        )
+        self.calibrate_button.grid(row=0, column=4, padx=(0, 8))
         ttk.Label(
             toolbar,
-            text="Workflow: open TIFF, manually draw wedge rectangle, review curve.",
-        ).grid(row=0, column=4, padx=(12, 8))
+            text="Draw a rectangle edge to edge over the 21 steps.",
+        ).grid(row=0, column=5, padx=(12, 8))
 
         self.reference_box = ttk.Combobox(
             toolbar,
@@ -71,7 +86,7 @@ class MainWindow(ttk.Frame):
         )
         self.analyze_button.grid(row=0, column=3, padx=(0, 8))
 
-        ttk.Label(toolbar, textvariable=self.file_text).grid(row=0, column=5, sticky="e")
+        ttk.Label(toolbar, textvariable=self.file_text).grid(row=0, column=6, sticky="e")
 
     def _build_body(self) -> None:
         body = ttk.Panedwindow(self, orient="horizontal")
@@ -101,7 +116,7 @@ class MainWindow(ttk.Frame):
         )
         self.summary_label.grid(row=1, column=0, sticky="ew", pady=(8, 8))
 
-        columns = ("curve", "strip", "loge", "wedge", "density", "signal")
+        columns = ("step", "strip", "loge", "wedge", "density", "spread", "signal")
         self.results_table = ttk.Treeview(
             graph_panel,
             columns=columns,
@@ -109,11 +124,12 @@ class MainWindow(ttk.Frame):
             height=14,
         )
         headings = {
-            "curve": ("Curve Step", 80),
+            "step": ("Step", 55),
             "strip": ("Strip Pos", 75),
             "loge": ("Rel Log E", 90),
             "wedge": ("Wedge OD", 85),
             "density": ("Density", 85),
+            "spread": ("±D", 65),
             "signal": ("Signal", 95),
         }
         for column, (label, width) in headings.items():
@@ -168,7 +184,13 @@ class MainWindow(ttk.Frame):
         self.file_text.set(
             f"{loaded_image.path.name}  |  {loaded_image.width}x{loaded_image.height}  |  {loaded_image.mode}"
         )
-        self.status_text.set("Manually draw a rectangle over the step wedge to analyze it.")
+        if loaded_image.source_dtype == "uint8":
+            self.status_text.set(
+                "8-bit scan loaded: it is probably gamma-encoded, so relative densities will be "
+                "compressed. Calibrate from a T2115 scan or rescan as linear 16-bit."
+            )
+        else:
+            self.status_text.set("Draw a rectangle edge to edge over the step wedge to analyze it.")
         self.image_canvas.set_image(loaded_image)
         self._clear_results()
         self._update_action_state()
@@ -183,11 +205,30 @@ class MainWindow(ttk.Frame):
         if self._loaded_image is not None and self._selection is not None:
             self._run_analysis()
 
+    def _calibrate(self) -> None:
+        if self._loaded_image is None or self._selection is None:
+            return
+        try:
+            self._calibration = calibrate_from_wedge(self._loaded_image.analysis_image, self._selection)
+        except Exception as error:  # pragma: no cover - Tk error dialog
+            messagebox.showerror("Calibration failed", str(error))
+            return
+        calibration = self._calibration
+        self.status_text.set(
+            f"Calibrated from {calibration.usable_steps} of {len(calibration.densities)} wedge steps, "
+            f"up to D {calibration.max_density:.2f}. Keep the scanner exposure locked. "
+            "Now select the sample strip."
+        )
+        self.reference_label.set(next(label for label, mode in REFERENCE_LABELS.items() if mode == "calibrated"))
+
     def _run_analysis(self) -> None:
         if self._loaded_image is None or self._selection is None:
             return
 
-        settings = AnalysisSettings(reference_mode=REFERENCE_LABELS[self.reference_label.get()])
+        settings = AnalysisSettings(
+            reference_mode=REFERENCE_LABELS[self.reference_label.get()],
+            calibration=self._calibration,
+        )
         try:
             result = analyze_selection(
                 self._loaded_image.analysis_image,
@@ -207,7 +248,9 @@ class MainWindow(ttk.Frame):
         self._draw_result_plot(result)
         self._populate_table(result)
         self._update_summary(result)
-        self.status_text.set("Analysis complete. Adjust the selection or reference mode to compare curves.")
+        self.status_text.set(
+            " ".join(result.warnings) or "Analysis complete. Check that the cell lines sit on the step edges."
+        )
         self._update_action_state()
 
     def _draw_placeholder_plot(self) -> None:
@@ -230,16 +273,18 @@ class MainWindow(ttk.Frame):
 
     def _draw_result_plot(self, result: AnalysisResult) -> None:
         self.axis.clear()
-        self.axis.plot(
+        self.axis.errorbar(
             result.x_values,
             result.y_values,
+            yerr=result.y_spreads,
             marker="o",
             linewidth=1.8,
+            capsize=2,
             color="#1d6fa5",
         )
         self.axis.set_title("Stouffer T2115 Print Density Curve")
         self.axis.set_xlabel("Relative log exposure")
-        ylabel = "Relative density (D)" if result.reference_mode == "selection_max" else "Density (D)"
+        ylabel = "Density above brightest step" if result.reference_mode == "relative" else "Density (D)"
         self.axis.set_ylabel(ylabel)
         self.axis.grid(True, alpha=0.25)
         self.axis.set_xlim(float(result.x_values.min()), float(result.x_values.max()))
@@ -253,26 +298,25 @@ class MainWindow(ttk.Frame):
                 "",
                 "end",
                 values=(
-                    measurement.graph_index,
+                    measurement.step,
                     measurement.spatial_index,
                     f"{measurement.relative_log_exposure:.2f}",
                     f"{measurement.wedge_density:.2f}",
                     f"{measurement.density:.3f}",
+                    f"{measurement.density_spread:.3f}",
                     f"{measurement.signal:.0f}",
                 ),
             )
 
     def _update_summary(self, result: AnalysisResult) -> None:
-        density_label = (
-            "relative to brightest detected step"
-            if result.reference_mode == "selection_max"
-            else "relative to 16-bit full scale"
-        )
+        if result.reference_mode == "relative":
+            reference_text = f"density above brightest step (signal {result.reference_value:.0f})"
+        else:
+            reference_text = f"calibrated, valid up to D {self._calibration.max_density:.2f}"
         self.summary_label.config(
             text=(
-                f"Detected {len(result.measurements)} steps in a {result.orientation} strip. "
-                f"Reference mode: {density_label}. "
-                f"Reference signal: {result.reference_value:.0f}."
+                f"{len(result.measurements)} equal cells in a {result.orientation} strip. "
+                f"Reference: {reference_text}."
             )
         )
 
@@ -284,3 +328,4 @@ class MainWindow(ttk.Frame):
     def _update_action_state(self) -> None:
         state = "normal" if self._loaded_image is not None and self._selection is not None else "disabled"
         self.analyze_button.config(state=state)
+        self.calibrate_button.config(state=state)

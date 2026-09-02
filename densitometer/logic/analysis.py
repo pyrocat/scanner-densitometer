@@ -1,13 +1,23 @@
-"""Analyze selected Stouffer T2115 strips and convert signals to density."""
+"""Measure step-wedge samples on a fixed cell grid and convert signals to density."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from .models import AnalysisResult, AnalysisSettings, Selection, StepMeasurement
+from .models import (
+    CLIP_LEVEL,
+    T2115_DENSITIES,
+    AnalysisResult,
+    AnalysisSettings,
+    Calibration,
+    Orientation,
+    Selection,
+    StepMeasurement,
+)
 
-# Nominal optical densities of the 21-step wedge, spaced by 0.15 density units.
-T2115_DENSITIES = np.array([0.05 + 0.15 * index for index in range(21)], dtype=np.float64)
+# Fraction of each cell (along the wedge) that is measured. The rest is margin
+# for hand-drawn selections that do not line up with the step edges exactly.
+CELL_FILL = 0.5
 
 
 def analyze_selection(
@@ -15,156 +25,150 @@ def analyze_selection(
     selection: Selection,
     settings: AnalysisSettings | None = None,
 ) -> AnalysisResult:
-    """Analyze a selected step-wedge strip and build density measurements.
+    """Measure a sample exposed through the wedge (negative or print).
+
+    The selection is divided into equal cells, one per wedge step, because the
+    wedge geometry is fixed. Steps are identified by position: the dark end of
+    the strip received the most exposure and is therefore wedge step 1.
 
     Args:
         image: Two-dimensional luminance image indexed as rows then columns.
-        selection: Rectangle enclosing one complete step wedge in image
-            coordinates.
-        settings: Step count and signal-reference configuration. Defaults to
-            :class:`AnalysisSettings` when omitted.
+        selection: Rectangle enclosing the complete wedge image, edge to edge.
+        settings: Wedge definition and density reference configuration.
 
     Returns:
-        The clipped selection, profiles, detected boundaries, reference value,
-        and one measurement per wedge step.
+        The clipped selection, cell boundaries, one measurement per wedge step
+        in step order, and data-quality warnings.
 
     Raises:
-        ValueError: If the selection cannot resolve the requested steps or the
-            configured reference mode is unsupported.
+        ValueError: If the selection is too small or calibrated mode is
+            requested without a calibration.
     """
     settings = settings or AnalysisSettings()
-    clipped_selection = selection.clipped(image.shape[1], image.shape[0])
+    if settings.reference_mode == "calibrated" and settings.calibration is None:
+        raise ValueError("Calibrated mode needs a calibration. Select the scanned T2115 and calibrate first.")
 
-    if not clipped_selection.is_large_enough(settings.step_count):
-        raise ValueError("The selected region is too small to resolve 21 steps.")
+    wedge = np.asarray(settings.wedge_densities, dtype=np.float64)
+    crop, clipped_selection, orientation = crop_strip(image, selection, len(wedge))
+    boundaries = equal_boundaries(crop.shape[1], len(wedge))
+    low, mid, high = measure_cells(crop, boundaries)
 
-    crop = image[
-        clipped_selection.y0 : clipped_selection.y1,
-        clipped_selection.x0 : clipped_selection.x1,
-    ]
-    if min(crop.shape) < 16:
-        raise ValueError("The selected strip is too thin to analyze reliably.")
+    # Whatever was exposed through the wedge is darkest behind its thinnest
+    # step, so the low-signal end of the strip is wedge step 1.
+    reversed_strip = mid[:3].mean() > mid[-3:].mean()
+    cells = np.arange(len(wedge))[::-1] if reversed_strip else np.arange(len(wedge))
 
-    # The long dimension runs along the wedge. Taking a median across its short
-    # dimension suppresses dust and local scanner noise in the 1-D profile.
-    orientation = "horizontal" if crop.shape[1] >= crop.shape[0] else "vertical"
-    profile = np.median(crop, axis=0 if orientation == "horizontal" else 1).astype(np.float64)
+    reference_value = None if settings.reference_mode == "calibrated" else float(max(mid.max(), 1.0))
+    densities = signal_to_density(mid[cells], settings, reference_value)
+    # The 16th/84th percentile signals pushed through the same mapping give one
+    # sigma of density variation inside each cell.
+    spreads = (
+        signal_to_density(low[cells], settings, reference_value)
+        - signal_to_density(high[cells], settings, reference_value)
+    ) / 2.0
+    # The densest wedge step passes the least light and defines zero exposure.
+    log_exposures = wedge[-1] - wedge
 
-    if profile.size < settings.step_count * 6:
-        raise ValueError("The selected strip is too short. Include the full 21-step wedge.")
+    measurements = tuple(
+        StepMeasurement(
+            step=step,
+            spatial_index=int(cells[index]) + 1,
+            signal=float(mid[cells[index]]),
+            density=float(densities[index]),
+            density_spread=float(spreads[index]),
+            relative_log_exposure=float(log_exposures[index]),
+            wedge_density=float(wedge[index]),
+        )
+        for index, step in enumerate(range(1, len(wedge) + 1))
+    )
 
-    # Scale smoothing with the selected strip while retaining a centered,
-    # odd-width window for short profiles.
-    smoothing_window = max(5, _nearest_odd(profile.size // 60))
-    smoothed_profile = moving_average(profile, smoothing_window)
-    boundaries = find_step_boundaries(smoothed_profile, settings.step_count)
-    signals = measure_segment_signals(crop, boundaries, orientation)
-    densities, reference_value = calculate_densities(signals, settings.reference_mode)
-    measurements = build_measurements(signals, densities)
+    warnings: list[str] = []
+    clipped = int(np.sum(mid >= CLIP_LEVEL))
+    if clipped:
+        warnings.append(f"{clipped} step(s) clipped at scanner white; reduce scanner exposure.")
+    if settings.calibration is not None:
+        beyond = int(np.sum(mid < settings.calibration.min_signal))
+        if beyond:
+            warnings.append(
+                f"{beyond} step(s) darker than the calibration can resolve "
+                f"(reported as D {settings.calibration.max_density:.2f})."
+            )
 
     return AnalysisResult(
         selection=clipped_selection,
         orientation=orientation,
         boundaries=boundaries,
-        profile=profile,
-        smoothed_profile=smoothed_profile,
         measurements=measurements,
         reference_mode=settings.reference_mode,
         reference_value=reference_value,
+        warnings=tuple(warnings),
     )
 
 
-def moving_average(values: np.ndarray, window: int) -> np.ndarray:
-    """Smooth a one-dimensional signal with a centered moving average.
+def calibrate_from_wedge(
+    image: np.ndarray,
+    selection: Selection,
+    wedge_densities: tuple[float, ...] = T2115_DENSITIES,
+) -> Calibration:
+    """Build a signal-to-density map from a scan of the wedge itself.
 
     Args:
-        values: Samples to smooth.
-        window: Requested kernel width; values below one are promoted to one,
-            and even widths are promoted to the next odd number.
+        image: Two-dimensional luminance image containing the scanned wedge.
+        selection: Rectangle enclosing the complete wedge, edge to edge.
+        wedge_densities: Known density of each step, step 1 first. Use the
+            certificate values for a calibrated wedge.
 
     Returns:
-        The floating-point convolution result using zero padding at the edges.
+        A :class:`Calibration` pairing each step's median signal with its
+        known density.
     """
-    # Odd kernel widths place the current sample at the center of the window.
-    window = max(1, _nearest_odd(window))
-    kernel = np.ones(window, dtype=np.float64) / float(window)
-    return np.convolve(values, kernel, mode="same")
+    wedge = tuple(float(value) for value in wedge_densities)
+    crop, _, _ = crop_strip(image, selection, len(wedge))
+    mid = measure_cells(crop, equal_boundaries(crop.shape[1], len(wedge)))[1]
+    # The wedge itself transmits least through step 21, so its dark end is
+    # the high-density end; the opposite of a sample exposed through it.
+    if mid[:3].mean() < mid[-3:].mean():
+        mid = mid[::-1]
+    return Calibration(signals=tuple(float(value) for value in mid), densities=wedge)
 
 
-def find_step_boundaries(profile: np.ndarray, step_count: int) -> np.ndarray:
-    """Locate step transitions in a smoothed wedge profile.
+def crop_strip(
+    image: np.ndarray,
+    selection: Selection,
+    step_count: int,
+) -> tuple[np.ndarray, Selection, Orientation]:
+    """Crop the selection and orient it so the wedge runs along axis 1.
 
     Args:
-        profile: One-dimensional signal along the length of the wedge.
-        step_count: Number of expected constant-signal regions.
+        image: Two-dimensional luminance image.
+        selection: Rectangle to crop, in image coordinates.
+        step_count: Number of cells the strip must be able to hold.
 
     Returns:
-        Integer boundaries including zero and ``len(profile)``. When reliable
-        transitions cannot be found, the profile is divided equally.
+        The crop with the wedge along columns, the clipped selection, and the
+        original orientation.
+
+    Raises:
+        ValueError: If the strip is too thin or too short to measure.
     """
-    # Strong changes in adjacent samples indicate transitions between steps;
-    # smoothing reduces the influence of isolated noise spikes.
-    edges = np.abs(np.diff(profile))
-    edge_strength = moving_average(edges, max(3, _nearest_odd(len(edges) // 80)))
-    candidate_indices = local_maxima(edge_strength)
-
-    # Ranking by strength finds prominent transitions first, while the minimum
-    # gap prevents multiple peaks around one physical edge from being selected.
-    minimum_gap = max(3, len(profile) // (step_count * 2))
-    ranked_candidates = sorted(
-        candidate_indices,
-        key=lambda index: edge_strength[index],
-        reverse=True,
-    )
-
-    chosen: list[int] = []
-    for index in ranked_candidates:
-        # Edge convolution is least trustworthy next to the profile endpoints.
-        if index < 1 or index > len(edges) - 2:
-            continue
-        if all(abs(index - existing) >= minimum_gap for existing in chosen):
-            chosen.append(index)
-        if len(chosen) == step_count - 1:
-            break
-
-    if len(chosen) != step_count - 1:
-        # A complete segmentation requires one interior boundary per transition.
-        return equal_boundaries(len(profile), step_count)
-
-    # ``np.diff`` positions transitions between samples, hence the +1 offset.
-    boundaries = np.array([0, *sorted(index + 1 for index in chosen), len(profile)], dtype=int)
-    widths = np.diff(boundaries)
-    minimum_width = max(2, len(profile) // (step_count * 6))
-    if np.any(widths < minimum_width):
-        # Reject implausibly narrow regions even when enough peaks were found.
-        return equal_boundaries(len(profile), step_count)
-
-    return boundaries
-
-
-def local_maxima(values: np.ndarray) -> np.ndarray:
-    """Return indices whose values are not lower than either neighbor.
-
-    Args:
-        values: One-dimensional samples in which to locate peaks.
-
-    Returns:
-        Integer indices of interior local maxima, or an empty array when fewer
-        than three samples are available.
-    """
-    if len(values) < 3:
-        return np.array([], dtype=int)
-    maxima_mask = (values[1:-1] >= values[:-2]) & (values[1:-1] >= values[2:])
-    # The mask starts at the second input sample, so restore its index offset.
-    return np.flatnonzero(maxima_mask) + 1
+    clipped = selection.clipped(image.shape[1], image.shape[0])
+    crop = image[clipped.y0 : clipped.y1, clipped.x0 : clipped.x1]
+    orientation: Orientation = "horizontal" if crop.shape[1] >= crop.shape[0] else "vertical"
+    if orientation == "vertical":
+        crop = crop.T
+    if crop.shape[0] < 16:
+        raise ValueError("The selected strip is too thin to analyze reliably.")
+    if crop.shape[1] < step_count * 6:
+        raise ValueError(f"The selected strip is too short. Include all {step_count} steps.")
+    return crop, clipped, orientation
 
 
 def equal_boundaries(length: int, step_count: int) -> np.ndarray:
-    """Divide a profile into equally sized fallback regions.
+    """Divide a strip of ``length`` samples into ``step_count`` equal cells.
 
     Args:
-        length: Number of samples in the profile.
-        step_count: Number of regions to create.
+        length: Number of samples along the wedge.
+        step_count: Number of cells to create.
 
     Returns:
         An integer array of ``step_count + 1`` boundary positions spanning zero
@@ -181,118 +185,47 @@ def equal_boundaries(length: int, step_count: int) -> np.ndarray:
     return boundaries
 
 
-def measure_segment_signals(
-    crop: np.ndarray,
-    boundaries: np.ndarray,
-    orientation: str,
-) -> np.ndarray:
-    """Measure a representative luminance signal within each wedge step.
+def measure_cells(crop: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
+    """Measure the central part of each cell along the wedge axis.
 
     Args:
-        crop: Two-dimensional image region containing the wedge.
-        boundaries: Consecutive segment boundaries along the wedge axis.
-        orientation: ``"horizontal"`` when boundaries address columns;
-            otherwise, boundaries address rows.
+        crop: Two-dimensional image region with the wedge along axis 1.
+        boundaries: Consecutive cell boundaries along axis 1.
 
     Returns:
-        One median luminance value per boundary interval, in spatial order.
+        A ``(3, cells)`` array holding the 16th, 50th, and 84th percentile
+        signal of each cell. The median is robust to dust and step numerals;
+        the outer percentiles measure the noise around it.
     """
-    signals: list[float] = []
+    percentiles = []
     for start, end in zip(boundaries[:-1], boundaries[1:]):
-        segment_length = end - start
-        trim = max(0, int(round(segment_length * 0.1)))
-        # Avoid transition pixels at both edges, but retain at least three
-        # samples along the wedge axis for narrow segments.
-        if segment_length - (trim * 2) >= 3:
-            start += trim
-            end -= trim
-
-        if orientation == "horizontal":
-            region = crop[:, start:end]
-        else:
-            region = crop[start:end, :]
-
-        # A median is robust to dust, scratches, and isolated hot pixels.
-        signals.append(float(np.median(region)))
-
-    return np.array(signals, dtype=np.float64)
+        margin = int((end - start) * (1.0 - CELL_FILL) / 2.0)
+        percentiles.append(np.percentile(crop[:, start + margin : end - margin], [16, 50, 84]))
+    return np.array(percentiles, dtype=np.float64).T
 
 
-def calculate_densities(signals: np.ndarray, reference_mode: str) -> tuple[np.ndarray, float]:
-    """Convert scanner signals to optical-density-like logarithmic values.
+def signal_to_density(
+    signals: np.ndarray,
+    settings: AnalysisSettings,
+    reference_value: float | None,
+) -> np.ndarray:
+    """Convert scanner signals to density.
 
     Args:
-        signals: Measured luminance values for the wedge steps.
-        reference_mode: ``"selection_max"`` for relative density or
-            ``"full_scale"`` for a 16-bit reference value of 65535.
+        signals: Measured luminance values.
+        settings: Supplies the reference mode and calibration.
+        reference_value: Zero-density signal for ``"relative"`` mode.
 
     Returns:
-        A tuple containing densities in signal order and the reference signal
-        used in their calculation.
+        Densities in signal order.
 
     Raises:
-        ValueError: If ``reference_mode`` is unsupported.
+        ValueError: If the reference mode is unsupported or lacks its inputs.
     """
-    # The lower bound prevents division by zero and infinite logarithms for
-    # completely black or invalid samples.
-    safe_signals = np.clip(signals, 1.0, None)
-    if reference_mode == "selection_max":
-        reference_value = float(np.max(safe_signals, initial=1.0))
-    elif reference_mode == "full_scale":
-        reference_value = 65535.0
-    else:
-        raise ValueError(f"Unsupported reference mode: {reference_mode}")
-
-    # Optical density is the base-10 logarithm of reference over transmission.
-    densities = np.log10(reference_value / safe_signals)
-    return densities, reference_value
-
-
-def build_measurements(
-    signals: np.ndarray,
-    densities: np.ndarray,
-) -> tuple[StepMeasurement, ...]:
-    """Pair measured signals with T2115 exposure metadata for plotting.
-
-    Args:
-        signals: Step signals in their spatial order within the selected strip.
-        densities: Calculated densities in the same spatial order.
-
-    Returns:
-        Measurements ordered by increasing calculated density, with one-based
-        graph and spatial indices.
-    """
-    # Sorting makes the plotted curve independent of which physical end of the
-    # wedge appears first in the selected image.
-    order = np.argsort(densities)
-    # The densest wedge step transmits the least exposure and therefore maps to
-    # zero relative log exposure at the start of the print-density curve.
-    ordered_wedge_densities = T2115_DENSITIES[::-1]
-    ordered_log_exposure = ordered_wedge_densities.max() - ordered_wedge_densities
-
-    measurements: list[StepMeasurement] = []
-    for graph_index, spatial_index in enumerate(order, start=1):
-        measurements.append(
-            StepMeasurement(
-                graph_index=graph_index,
-                spatial_index=int(spatial_index) + 1,
-                signal=float(signals[spatial_index]),
-                density=float(densities[spatial_index]),
-                relative_log_exposure=float(ordered_log_exposure[graph_index - 1]),
-                wedge_density=float(ordered_wedge_densities[graph_index - 1]),
-            )
-        )
-
-    return tuple(measurements)
-
-
-def _nearest_odd(value: int) -> int:
-    """Return ``value`` when odd, or the next greater integer when even.
-
-    Args:
-        value: Integer to normalize for use as a centered kernel width.
-
-    Returns:
-        An odd integer equal to ``value`` or ``value + 1``.
-    """
-    return value if value % 2 else value + 1
+    if settings.reference_mode == "calibrated" and settings.calibration is not None:
+        return settings.calibration.apply(np.asarray(signals, dtype=np.float64))
+    if settings.reference_mode == "relative" and reference_value is not None:
+        # Density above the brightest step. This assumes a linear scanner with
+        # no black offset, so it compresses at high density; calibrate to fix.
+        return np.log10(reference_value / np.clip(signals, 1.0, None))
+    raise ValueError(f"Unsupported reference mode: {settings.reference_mode}")

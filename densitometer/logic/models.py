@@ -1,4 +1,4 @@
-"""Shared data models for loaded images, selections, and analysis results."""
+"""Shared data models for loaded images, selections, calibration, and results."""
 
 from __future__ import annotations
 
@@ -10,9 +10,17 @@ import numpy as np
 from PIL.Image import Image as PilImage
 
 
-# Density calculations can use either the brightest selected step or the
-# scanner's nominal 16-bit maximum as their zero-density reference.
-ReferenceMode = Literal["selection_max", "full_scale"]
+# Nominal Stouffer T2115 densities, step 1 (0.05) through step 21 (3.05), 0.15
+# apart (one half stop). Replace with the certificate values of a calibrated
+# T2115C wedge when available.
+T2115_DENSITIES: tuple[float, ...] = tuple(round(0.05 + 0.15 * index, 2) for index in range(21))
+
+# Signals within 2% of 16-bit full scale are treated as clipped by the scanner.
+CLIP_LEVEL = 0.98 * 65535.0
+
+# ``relative`` reports density above the brightest step (base + fog or paper
+# white); ``calibrated`` maps signal through a scanned target of known density.
+ReferenceMode = Literal["relative", "calibrated"]
 
 # Orientation identifies the image axis along which wedge steps are arranged.
 Orientation = Literal["horizontal", "vertical"]
@@ -126,16 +134,69 @@ class Selection:
 
 
 @dataclass(frozen=True, slots=True)
-class AnalysisSettings:
-    """Configure wedge segmentation and density reference behavior.
+class Calibration:
+    """Signal-to-density map built from a scan of a target with known densities.
+
+    Valid only for scans made with the same scanner, light path (transmission
+    or reflection), and locked exposure settings as the target scan.
 
     Attributes:
-        step_count: Number of expected regions in the selected wedge.
-        reference_mode: Signal source treated as the zero-density reference.
+        signals: Median scanner signal of each target step, step 1 first.
+        densities: Known density of each target step, in the same order.
     """
 
-    step_count: int = 21
-    reference_mode: ReferenceMode = "selection_max"
+    signals: tuple[float, ...]
+    densities: tuple[float, ...]
+
+    def table(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return usable ``(log10 signal, density)`` pairs, ascending in signal.
+
+        Steps that are clipped, or whose signal is not below every lighter
+        step, are dropped: beyond the scanner's own flare floor the signal
+        flattens and cannot be inverted into density.
+        """
+        signals = np.asarray(self.signals, dtype=np.float64)
+        densities = np.asarray(self.densities, dtype=np.float64)
+        lighter_minimum = np.minimum.accumulate(np.concatenate(([np.inf], signals[:-1])))
+        keep = (signals < lighter_minimum) & (signals < CLIP_LEVEL)
+        log_signals = np.log10(np.clip(signals[keep], 1.0, None))
+        return log_signals[::-1], densities[keep][::-1]
+
+    @property
+    def usable_steps(self) -> int:
+        """Number of target steps that contribute to the map."""
+        return len(self.table()[0])
+
+    @property
+    def min_signal(self) -> float:
+        """Darkest signal the map can still resolve."""
+        return float(10 ** self.table()[0][0])
+
+    @property
+    def max_density(self) -> float:
+        """Highest density the map can report; darker samples clamp to it."""
+        return float(self.table()[1][0])
+
+    def apply(self, signals: np.ndarray) -> np.ndarray:
+        """Map scanner signals to density by interpolating in log signal."""
+        log_signals, densities = self.table()
+        return np.interp(np.log10(np.clip(signals, 1.0, None)), log_signals, densities)
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisSettings:
+    """Configure the wedge definition and density reference behavior.
+
+    Attributes:
+        wedge_densities: Density of each wedge step, step 1 first. Its length
+            sets the number of cells the selection is divided into.
+        reference_mode: Signal-to-density strategy.
+        calibration: Required when ``reference_mode`` is ``"calibrated"``.
+    """
+
+    wedge_densities: tuple[float, ...] = T2115_DENSITIES
+    reference_mode: ReferenceMode = "relative"
+    calibration: Calibration | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,59 +204,60 @@ class StepMeasurement:
     """Describe one measured wedge step and its plotting metadata.
 
     Attributes:
-        graph_index: One-based position after sorting by measured density.
-        spatial_index: One-based position along the selected image strip.
-        signal: Median luminance measured inside the step.
-        density: Base-10 density calculated from ``signal``.
+        step: One-based wedge step number; step 1 is the thinnest wedge step
+            and therefore the most exposed (darkest) sample cell.
+        spatial_index: One-based cell position along the selected image strip.
+        signal: Median luminance measured inside the cell.
+        density: Density calculated from ``signal``.
+        density_spread: One-sigma density variation inside the cell. Large
+            values indicate dust, texture, or a cell straddling a step edge.
         relative_log_exposure: Exposure-axis value assigned from wedge spacing.
-        wedge_density: Nominal optical density of the corresponding T2115 step.
+        wedge_density: Nominal optical density of the corresponding wedge step.
     """
 
-    graph_index: int
+    step: int
     spatial_index: int
     signal: float
     density: float
+    density_spread: float
     relative_log_exposure: float
     wedge_density: float
 
 
 @dataclass(frozen=True, slots=True)
 class AnalysisResult:
-    """Collect profiles, segmentation data, and measurements for one selection.
+    """Collect segmentation data and measurements for one selection.
 
     Attributes:
         selection: Normalized, image-clipped region that was analyzed.
         orientation: Axis along which the wedge steps are arranged.
-        boundaries: Segment endpoints relative to the selected crop's wedge
-            axis, including the first and final endpoints.
-        profile: Unsmoothed one-dimensional median signal through the wedge.
-        smoothed_profile: Profile used for transition detection.
-        measurements: Step records ordered for plotting by increasing density.
+        boundaries: Cell endpoints relative to the selected crop's wedge axis,
+            including the first and final endpoints.
+        measurements: Step records in wedge step order.
         reference_mode: Density reference strategy used for the analysis.
-        reference_value: Signal value treated as zero optical density.
+        reference_value: Signal treated as zero density in relative mode.
+        warnings: Human-readable data-quality problems found in the strip.
     """
 
     selection: Selection
     orientation: Orientation
     boundaries: np.ndarray
-    profile: np.ndarray
-    smoothed_profile: np.ndarray
     measurements: tuple[StepMeasurement, ...]
     reference_mode: ReferenceMode
-    reference_value: float
+    reference_value: float | None
+    warnings: tuple[str, ...] = ()
 
     @property
     def x_values(self) -> np.ndarray:
         """Return relative log exposures as a new ``float64`` plotting array."""
-        return np.array(
-            [measurement.relative_log_exposure for measurement in self.measurements],
-            dtype=np.float64,
-        )
+        return np.array([m.relative_log_exposure for m in self.measurements], dtype=np.float64)
 
     @property
     def y_values(self) -> np.ndarray:
         """Return measured densities as a new ``float64`` plotting array."""
-        return np.array(
-            [measurement.density for measurement in self.measurements],
-            dtype=np.float64,
-        )
+        return np.array([m.density for m in self.measurements], dtype=np.float64)
+
+    @property
+    def y_spreads(self) -> np.ndarray:
+        """Return per-step density spreads as a new ``float64`` plotting array."""
+        return np.array([m.density_spread for m in self.measurements], dtype=np.float64)
