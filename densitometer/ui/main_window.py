@@ -65,7 +65,7 @@ class MainWindow(ttk.Frame):
         self.calibrate_button.grid(row=0, column=4, padx=(0, 8))
         ttk.Label(
             toolbar,
-            text="Draw a rectangle edge to edge over the 21 steps.",
+            text="Drag along the wedge end to end; handles rotate, stretch, widen, move.",
         ).grid(row=0, column=5, padx=(12, 8))
 
         self.reference_box = ttk.Combobox(
@@ -190,7 +190,7 @@ class MainWindow(ttk.Frame):
                 "compressed. Calibrate from a T2115 scan or rescan as linear 16-bit."
             )
         else:
-            self.status_text.set("Draw a rectangle edge to edge over the step wedge to analyze it.")
+            self.status_text.set("Drag from one end of the step wedge to the other, then adjust the handles.")
         self.image_canvas.set_image(loaded_image)
         self._clear_results()
         self._update_action_state()
@@ -239,12 +239,9 @@ class MainWindow(ttk.Frame):
             messagebox.showerror("Analysis failed", str(error))
             self.status_text.set(str(error))
             self._analysis_result = None
-            self.image_canvas.set_analysis_result(None)
             return
 
         self._analysis_result = result
-        self._selection = result.selection
-        self.image_canvas.set_analysis_result(result)
         self._draw_result_plot(result)
         self._populate_table(result)
         self._update_summary(result)
@@ -315,7 +312,7 @@ class MainWindow(ttk.Frame):
             reference_text = f"calibrated, valid up to D {self._calibration.max_density:.2f}"
         self.summary_label.config(
             text=(
-                f"{len(result.measurements)} equal cells in a {result.orientation} strip. "
+                f"{len(result.measurements)} equal cells along the strip. "
                 f"Reference: {reference_text}."
             )
         )

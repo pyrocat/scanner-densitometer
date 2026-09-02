@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -21,10 +22,6 @@ CLIP_LEVEL = 0.98 * 65535.0
 # ``relative`` reports density above the brightest step (base + fog or paper
 # white); ``calibrated`` maps signal through a scanned target of known density.
 ReferenceMode = Literal["relative", "calibrated"]
-
-# Orientation identifies the image axis along which wedge steps are arranged.
-Orientation = Literal["horizontal", "vertical"]
-
 
 @dataclass(frozen=True, slots=True)
 class LoadedImage:
@@ -55,82 +52,72 @@ class LoadedImage:
 
 @dataclass(frozen=True, slots=True)
 class Selection:
-    """Represent a rectangular image selection using half-open coordinates.
+    """A rotatable strip defined by its centreline and width, in image pixels.
 
-    The first corner is inclusive and the second is exclusive, matching NumPy
-    slice semantics. Corners may be supplied in either drag direction and can
-    be ordered with :meth:`normalized` before use.
+    The centreline runs from ``(x0, y0)`` to ``(x1, y1)`` along the wedge, so
+    moving an endpoint rotates and resizes the strip in one gesture. ``width``
+    is the extent across the wedge, centred on the line. Coordinates are
+    continuous: pixel ``(row, column)`` covers ``[column, column + 1)`` by
+    ``[row, row + 1)``.
 
     Attributes:
-        x0: Horizontal coordinate of the first corner.
-        y0: Vertical coordinate of the first corner.
-        x1: Horizontal coordinate of the opposite corner.
-        y1: Vertical coordinate of the opposite corner.
+        x0: Horizontal coordinate of the first end of the centreline.
+        y0: Vertical coordinate of the first end of the centreline.
+        x1: Horizontal coordinate of the second end of the centreline.
+        y1: Vertical coordinate of the second end of the centreline.
+        width: Extent across the wedge.
     """
 
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-
-    def normalized(self) -> "Selection":
-        """Order both coordinate pairs from minimum to maximum.
-
-        Returns:
-            A new selection whose first corner is top-left and whose second
-            corner is bottom-right.
-        """
-        return Selection(
-            x0=min(self.x0, self.x1),
-            y0=min(self.y0, self.y1),
-            x1=max(self.x0, self.x1),
-            y1=max(self.y0, self.y1),
-        )
-
-    def clipped(self, width: int, height: int) -> "Selection":
-        """Normalize the selection and constrain it to image boundaries.
-
-        Args:
-            width: Positive image width in pixels.
-            height: Positive image height in pixels.
-
-        Returns:
-            A new selection whose start coordinates are valid pixel indices and
-            whose exclusive end coordinates do not exceed the image dimensions.
-        """
-        normalized = self.normalized()
-        # Start coordinates identify pixels and stop at dimension - 1. Exclusive
-        # end coordinates may equal the full image dimension.
-        return Selection(
-            x0=max(0, min(normalized.x0, width - 1)),
-            y0=max(0, min(normalized.y0, height - 1)),
-            x1=max(1, min(normalized.x1, width)),
-            y1=max(1, min(normalized.y1, height)),
-        )
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    width: float
 
     @property
-    def width(self) -> int:
-        """Return the non-negative horizontal extent in pixels."""
-        normalized = self.normalized()
-        return normalized.x1 - normalized.x0
+    def length(self) -> float:
+        """Return the centreline length in pixels."""
+        return math.hypot(self.x1 - self.x0, self.y1 - self.y0)
 
     @property
-    def height(self) -> int:
-        """Return the non-negative vertical extent in pixels."""
-        normalized = self.normalized()
-        return normalized.y1 - normalized.y0
+    def axis(self) -> tuple[float, float]:
+        """Return the unit vector along the centreline (x-axis for a point)."""
+        length = self.length
+        if length == 0.0:
+            return 1.0, 0.0
+        return (self.x1 - self.x0) / length, (self.y1 - self.y0) / length
 
-    def is_large_enough(self, minimum_size: int = 21) -> bool:
-        """Check whether both dimensions meet a minimum size.
+    def point_at(self, along: float, across: float) -> tuple[float, float]:
+        """Return image coordinates for strip-local offsets.
 
         Args:
-            minimum_size: Required pixel extent on each axis.
-
-        Returns:
-            ``True`` when both normalized dimensions are at least
-            ``minimum_size``; otherwise, ``False``.
+            along: Distance from the first end along the centreline.
+            across: Signed distance from the centreline; positive is clockwise
+                from the axis in image coordinates (y down).
         """
-        return self.width >= minimum_size and self.height >= minimum_size
+        ux, uy = self.axis
+        return self.x0 + ux * along - uy * across, self.y0 + uy * along + ux * across
+
+    def local(self, x: float, y: float) -> tuple[float, float]:
+        """Return ``(along, across)`` strip-local offsets of an image point."""
+        ux, uy = self.axis
+        dx, dy = x - self.x0, y - self.y0
+        return dx * ux + dy * uy, -dx * uy + dy * ux
+
+    def corners(self) -> tuple[tuple[float, float], ...]:
+        """Return the four corners in drawing order."""
+        half = self.width / 2.0
+        return (
+            self.point_at(0.0, -half),
+            self.point_at(self.length, -half),
+            self.point_at(self.length, half),
+            self.point_at(0.0, half),
+        )
+
+    def contains(self, x: float, y: float) -> bool:
+        """Check whether an image point lies inside the strip."""
+        along, across = self.local(x, y)
+        return 0.0 <= along <= self.length and abs(across) <= self.width / 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,9 +216,8 @@ class AnalysisResult:
     """Collect segmentation data and measurements for one selection.
 
     Attributes:
-        selection: Normalized, image-clipped region that was analyzed.
-        orientation: Axis along which the wedge steps are arranged.
-        boundaries: Cell endpoints relative to the selected crop's wedge axis,
+        selection: Strip that was analyzed.
+        boundaries: Cell endpoints in pixels along the strip centreline,
             including the first and final endpoints.
         measurements: Step records in wedge step order.
         reference_mode: Density reference strategy used for the analysis.
@@ -240,7 +226,6 @@ class AnalysisResult:
     """
 
     selection: Selection
-    orientation: Orientation
     boundaries: np.ndarray
     measurements: tuple[StepMeasurement, ...]
     reference_mode: ReferenceMode

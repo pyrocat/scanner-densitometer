@@ -11,7 +11,7 @@
 - `poetry run python -m unittest discover -s tests -v` runs the complete test suite with verbose names.
 - `poetry build` creates source and wheel distributions under `dist/`.
 
-For meaningful manual checks, open a linear 16-bit TIFF and select a rectangle spanning the complete 21-step wedge edge to edge. The wedge geometry is fixed (Stouffer T2115), so steps are divided equally, never detected.
+For meaningful manual checks, open a linear 16-bit TIFF and drag a strip along the complete 21-step wedge end to end; it can be rotated, stretched, widened, and moved with its handles. The wedge geometry is fixed (Stouffer T2115), so steps are divided equally, never detected.
 
 ## Coding Style & Naming Conventions
 
@@ -23,7 +23,7 @@ Follow standard PEP 8 formatting with four-space indentation. Preserve the exist
 
 ## Testing Guidelines
 
-Tests use the standard-library `unittest` framework with NumPy assertions where appropriate. Name files `test_*.py`, classes `*Tests`, and methods `test_<behavior>`. Prefer small synthetic arrays over large image fixtures. Cover horizontal and vertical wedges, invalid selections, strip direction, calibration, and both density reference modes when changing analysis code. There is no configured coverage threshold; every bug fix should include a regression test.
+Tests use the standard-library `unittest` framework with NumPy assertions where appropriate. Name files `test_*.py`, classes `*Tests`, and methods `test_<behavior>`. Prefer small synthetic arrays over large image fixtures. Cover horizontal, rotated, and reversed wedges, invalid selections, strip direction, calibration, and both density reference modes when changing analysis code. There is no configured coverage threshold; every bug fix should include a regression test.
 
 ## Commit & Pull Request Guidelines
 

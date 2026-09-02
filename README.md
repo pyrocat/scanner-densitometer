@@ -5,12 +5,14 @@ Tkinter app for using a flatbed scanner as a practical densitometer surrogate wh
 The app does not talk to the scanner directly. It assumes the scan has already been made and saved as a 16-bit TIFF. The workflow is:
 
 1. Open a TIFF scan.
-2. Optionally draw a rectangle over a scan of the T2115 itself and click
+2. Optionally drag a strip over a scan of the T2115 itself and click
    **Calibrate from Selection**. This maps scanner signal to real density
    using the wedge's known 0.05–3.05 D steps.
-3. Draw a rectangle edge to edge over the wedge image on the sample (negative
-   or print). The app divides it into 21 equal cells, because the T2115
-   geometry is fixed, measures the centre of each cell, and plots the curve.
+3. Drag from one end of the wedge image on the sample (negative or print) to
+   the other. The strip can sit at any angle: drag an end handle to rotate or
+   stretch it, a side handle to set the width, or its inside to move it. The
+   app divides the strip into 21 equal cells, because the T2115 geometry is
+   fixed, measures the centre of each cell, and plots the curve.
 
 ## Why this approach
 
@@ -75,7 +77,7 @@ For this project, that becomes a simpler desktop workflow:
 
 - Best results require a linear 16-bit TIFF with scanner corrections disabled. Calibrated mode also works with gamma-encoded scans, because the calibration absorbs any monotonic encoding.
 - The app supports grayscale TIFFs directly and also accepts RGB TIFFs by converting them to luminance.
-- The selection must span the 21 steps edge to edge; the grid is not detected, only divided. Check the overlaid cell lines and the ±D column.
+- The strip's centreline must span the 21 steps end to end; the grid is not detected, only divided. Check the overlaid cell lines and the ±D column.
 - A calibration is only valid for scans made with the same scanner, light path (transmission or reflection), and locked exposure. Scanning the wedge alongside the sample is the safest workflow.
 - Calibrating with the T2115 covers transmission scans. Reflection prints get relative densities unless a reflection step tablet is used as the calibration target.
 - Relative mode assumes a linear scanner with no black offset, so it compresses high densities; treat it as approximate.

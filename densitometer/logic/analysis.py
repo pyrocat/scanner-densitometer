@@ -10,7 +10,6 @@ from .models import (
     AnalysisResult,
     AnalysisSettings,
     Calibration,
-    Orientation,
     Selection,
     StepMeasurement,
 )
@@ -33,12 +32,12 @@ def analyze_selection(
 
     Args:
         image: Two-dimensional luminance image indexed as rows then columns.
-        selection: Rectangle enclosing the complete wedge image, edge to edge.
+        selection: Strip whose centreline spans the complete wedge, end to end.
         settings: Wedge definition and density reference configuration.
 
     Returns:
-        The clipped selection, cell boundaries, one measurement per wedge step
-        in step order, and data-quality warnings.
+        The selection, cell boundaries, one measurement per wedge step in step
+        order, and data-quality warnings.
 
     Raises:
         ValueError: If the selection is too small or calibrated mode is
@@ -49,7 +48,7 @@ def analyze_selection(
         raise ValueError("Calibrated mode needs a calibration. Select the scanned T2115 and calibrate first.")
 
     wedge = np.asarray(settings.wedge_densities, dtype=np.float64)
-    crop, clipped_selection, orientation = crop_strip(image, selection, len(wedge))
+    crop = extract_strip(image, selection, len(wedge))
     boundaries = equal_boundaries(crop.shape[1], len(wedge))
     low, mid, high = measure_cells(crop, boundaries)
 
@@ -95,8 +94,7 @@ def analyze_selection(
             )
 
     return AnalysisResult(
-        selection=clipped_selection,
-        orientation=orientation,
+        selection=selection,
         boundaries=boundaries,
         measurements=measurements,
         reference_mode=settings.reference_mode,
@@ -114,7 +112,7 @@ def calibrate_from_wedge(
 
     Args:
         image: Two-dimensional luminance image containing the scanned wedge.
-        selection: Rectangle enclosing the complete wedge, edge to edge.
+        selection: Strip whose centreline spans the complete wedge, end to end.
         wedge_densities: Known density of each step, step 1 first. Use the
             certificate values for a calibrated wedge.
 
@@ -123,7 +121,7 @@ def calibrate_from_wedge(
         known density.
     """
     wedge = tuple(float(value) for value in wedge_densities)
-    crop, _, _ = crop_strip(image, selection, len(wedge))
+    crop = extract_strip(image, selection, len(wedge))
     mid = measure_cells(crop, equal_boundaries(crop.shape[1], len(wedge)))[1]
     # The wedge itself transmits least through step 21, so its dark end is
     # the high-density end; the opposite of a sample exposed through it.
@@ -132,35 +130,39 @@ def calibrate_from_wedge(
     return Calibration(signals=tuple(float(value) for value in mid), densities=wedge)
 
 
-def crop_strip(
-    image: np.ndarray,
-    selection: Selection,
-    step_count: int,
-) -> tuple[np.ndarray, Selection, Orientation]:
-    """Crop the selection and orient it so the wedge runs along axis 1.
+def extract_strip(image: np.ndarray, selection: Selection, step_count: int) -> np.ndarray:
+    """Resample the (possibly rotated) strip so the wedge runs along axis 1.
+
+    Nearest-neighbour sampling keeps every value an actual scanner reading;
+    the percentile statistics taken later do not benefit from interpolation.
 
     Args:
         image: Two-dimensional luminance image.
-        selection: Rectangle to crop, in image coordinates.
+        selection: Strip to extract, in image coordinates.
         step_count: Number of cells the strip must be able to hold.
 
     Returns:
-        The crop with the wedge along columns, the clipped selection, and the
-        original orientation.
+        An array of shape ``(width, length)`` with the first end of the
+        centreline at column zero. Samples outside the image repeat its edge.
 
     Raises:
         ValueError: If the strip is too thin or too short to measure.
     """
-    clipped = selection.clipped(image.shape[1], image.shape[0])
-    crop = image[clipped.y0 : clipped.y1, clipped.x0 : clipped.x1]
-    orientation: Orientation = "horizontal" if crop.shape[1] >= crop.shape[0] else "vertical"
-    if orientation == "vertical":
-        crop = crop.T
-    if crop.shape[0] < 16:
+    length = int(round(selection.length))
+    width = int(round(selection.width))
+    if width < 16:
         raise ValueError("The selected strip is too thin to analyze reliably.")
-    if crop.shape[1] < step_count * 6:
+    if length < step_count * 6:
         raise ValueError(f"The selected strip is too short. Include all {step_count} steps.")
-    return crop, clipped, orientation
+
+    ux, uy = selection.axis
+    along = np.arange(length) + 0.5
+    across = np.arange(width) - (width - 1) / 2.0
+    xs = selection.x0 + ux * along[np.newaxis, :] - uy * across[:, np.newaxis]
+    ys = selection.y0 + uy * along[np.newaxis, :] + ux * across[:, np.newaxis]
+    rows = np.clip(np.floor(ys).astype(int), 0, image.shape[0] - 1)
+    columns = np.clip(np.floor(xs).astype(int), 0, image.shape[1] - 1)
+    return image[rows, columns]
 
 
 def equal_boundaries(length: int, step_count: int) -> np.ndarray:
