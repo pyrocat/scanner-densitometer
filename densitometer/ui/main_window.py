@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from ..logic.analysis import analyze_selection, calibrate_from_wedge
+from ..logic.analysis import (
+    analyze_selection,
+    calibrate_from_wedge,
+    flag_signals,
+    measure_patch,
+    signal_to_density,
+)
 from ..logic.image_loader import load_image
 from ..logic.models import (
     AnalysisResult,
@@ -16,7 +22,9 @@ from ..logic.models import (
     LoadedImage,
     ReferenceMode,
     Selection,
+    T2115_DENSITIES,
 )
+from ..logic.sensitometry import IsoRangeEstimate, iso_range_from_analysis
 from .image_canvas import ImageCanvas
 
 REFERENCE_LABELS: dict[str, ReferenceMode] = {
@@ -32,6 +40,11 @@ class MainWindow(ttk.Frame):
         self._selection: Selection | None = None
         self._analysis_result: AnalysisResult | None = None
         self._calibration: Calibration | None = None
+        # Median signal of an unexposed, processed patch (ISO 6846 clause 5.6.2).
+        self._patch_signal: float | None = None
+        # Density of each step of the wedge the sample was exposed through;
+        # replace the nominal values with certificate values when known.
+        self._wedge_densities: tuple[float, ...] = T2115_DENSITIES
 
         self.reference_label = tk.StringVar(value=next(iter(REFERENCE_LABELS)))
         self.status_text = tk.StringVar(
@@ -50,7 +63,7 @@ class MainWindow(ttk.Frame):
     def _build_toolbar(self) -> None:
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        toolbar.columnconfigure(6, weight=1)
+        toolbar.columnconfigure(8, weight=1)
 
         ttk.Button(toolbar, text="Open TIFF...", command=self._open_file).grid(
             row=0, column=0, padx=(0, 8)
@@ -63,10 +76,20 @@ class MainWindow(ttk.Frame):
             state="disabled",
         )
         self.calibrate_button.grid(row=0, column=4, padx=(0, 8))
+        self.patch_button = ttk.Button(
+            toolbar,
+            text="Unexposed Patch from Selection",
+            command=self._measure_patch,
+            state="disabled",
+        )
+        self.patch_button.grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(toolbar, text="Wedge Densities...", command=self._edit_wedge_densities).grid(
+            row=0, column=6, padx=(0, 8)
+        )
         ttk.Label(
             toolbar,
             text="Drag along the wedge end to end; handles rotate, stretch, widen, move.",
-        ).grid(row=0, column=5, padx=(12, 8))
+        ).grid(row=0, column=7, padx=(12, 8))
 
         self.reference_box = ttk.Combobox(
             toolbar,
@@ -86,7 +109,7 @@ class MainWindow(ttk.Frame):
         )
         self.analyze_button.grid(row=0, column=3, padx=(0, 8))
 
-        ttk.Label(toolbar, textvariable=self.file_text).grid(row=0, column=6, sticky="e")
+        ttk.Label(toolbar, textvariable=self.file_text).grid(row=0, column=8, sticky="e")
 
     def _build_body(self) -> None:
         body = ttk.Panedwindow(self, orient="horizontal")
@@ -181,6 +204,7 @@ class MainWindow(ttk.Frame):
         self._loaded_image = loaded_image
         self._selection = None
         self._analysis_result = None
+        self._patch_signal = None
         self.file_text.set(
             f"{loaded_image.path.name}  |  {loaded_image.width}x{loaded_image.height}  |  {loaded_image.mode}"
         )
@@ -205,11 +229,61 @@ class MainWindow(ttk.Frame):
         if self._loaded_image is not None and self._selection is not None:
             self._run_analysis()
 
-    def _calibrate(self) -> None:
+    def _ask_densities(self, title: str, prompt: str, initial: tuple[float, ...]) -> tuple[float, ...] | None:
+        answer = simpledialog.askstring(
+            title, prompt, initialvalue=", ".join(f"{d:.2f}" for d in initial), parent=self
+        )
+        if not answer:
+            return None
+        return tuple(float(value) for value in answer.replace(";", ",").split(","))
+
+    def _edit_wedge_densities(self) -> None:
+        try:
+            densities = self._ask_densities(
+                "Wedge step densities",
+                "Density of each step of the wedge the sample was exposed through, step 1 first:",
+                self._wedge_densities,
+            )
+            if densities is None:
+                return
+            if len(densities) < 3 or any(b <= a for a, b in zip(densities, densities[1:])):
+                raise ValueError("Wedge densities must be at least three values, strictly increasing.")
+        except ValueError as error:
+            messagebox.showerror("Invalid wedge densities", str(error))
+            return
+        self._wedge_densities = densities
+        self.status_text.set(f"Using {len(densities)} wedge step densities for the exposure axis.")
+        self._reanalyze_current_selection()
+
+    def _measure_patch(self) -> None:
         if self._loaded_image is None or self._selection is None:
             return
         try:
-            self._calibration = calibrate_from_wedge(self._loaded_image.analysis_image, self._selection)
+            self._patch_signal = measure_patch(self._loaded_image.analysis_image, self._selection)
+        except Exception as error:  # pragma: no cover - Tk error dialog
+            messagebox.showerror("Patch measurement failed", str(error))
+            return
+        self.status_text.set(
+            f"Unexposed patch signal {self._patch_signal:.0f} stored as Dmin. Now select the wedge strip."
+        )
+
+    def _calibrate(self) -> None:
+        if self._loaded_image is None or self._selection is None:
+            return
+        # Any scanned target of known densities works: the T2115 (nominal or
+        # certificate values) for transmission, a reflection gray scale such
+        # as a Kodak Q-13 for prints. The cell count follows the list length.
+        try:
+            densities = self._ask_densities(
+                "Target step densities",
+                "Known density of each step of the scanned target, lightest first:",
+                self._wedge_densities,
+            )
+            if densities is None:
+                return
+            self._calibration = calibrate_from_wedge(
+                self._loaded_image.analysis_image, self._selection, densities
+            )
         except Exception as error:  # pragma: no cover - Tk error dialog
             messagebox.showerror("Calibration failed", str(error))
             return
@@ -226,6 +300,7 @@ class MainWindow(ttk.Frame):
             return
 
         settings = AnalysisSettings(
+            wedge_densities=self._wedge_densities,
             reference_mode=REFERENCE_LABELS[self.reference_label.get()],
             calibration=self._calibration,
         )
@@ -235,6 +310,12 @@ class MainWindow(ttk.Frame):
                 self._selection,
                 settings,
             )
+        except ValueError as error:
+            # Expected for a selection that is not a wedge strip, such as a
+            # patch about to be stored; keep it in the status bar, not modal.
+            self.status_text.set(f"{error} Short selections can still be stored as the unexposed patch.")
+            self._analysis_result = None
+            return
         except Exception as error:  # pragma: no cover - Tk error dialog
             messagebox.showerror("Analysis failed", str(error))
             self.status_text.set(str(error))
@@ -242,12 +323,25 @@ class MainWindow(ttk.Frame):
             return
 
         self._analysis_result = result
-        self._draw_result_plot(result)
+        notes = list(result.warnings)
+        estimate: IsoRangeEstimate | None = None
+        try:
+            dmin = None
+            if self._patch_signal is not None:
+                clipped, clamped = flag_signals([self._patch_signal], settings)
+                if clipped[0] or clamped[0]:
+                    raise ValueError("ISO(R) refused: the unexposed patch is clipped or outside the calibration range.")
+                dmin = float(signal_to_density([self._patch_signal], settings, result.reference_value)[0])
+            estimate = iso_range_from_analysis(result, dmin)
+            notes.extend(estimate.warnings)
+            if result.reference_mode == "relative":
+                notes.append("Relative mode: scanner flare biases R low; calibrate from a reflection gray scale.")
+        except ValueError as error:
+            notes.append(str(error))
+        self._draw_result_plot(result, estimate)
         self._populate_table(result)
-        self._update_summary(result)
-        self.status_text.set(
-            " ".join(result.warnings) or "Analysis complete. Check that the cell lines sit on the step edges."
-        )
+        self._update_summary(result, estimate)
+        self.status_text.set(" ".join(notes) or "Analysis complete. Check that the cell lines sit on the step edges.")
         self._update_action_state()
 
     def _draw_placeholder_plot(self) -> None:
@@ -268,8 +362,14 @@ class MainWindow(ttk.Frame):
         self.figure.tight_layout()
         self.plot_canvas.draw_idle()
 
-    def _draw_result_plot(self, result: AnalysisResult) -> None:
+    def _draw_result_plot(self, result: AnalysisResult, estimate: IsoRangeEstimate | None = None) -> None:
         self.axis.clear()
+        if estimate is not None:
+            for density in (estimate.density_ht, estimate.density_hs):
+                self.axis.axhline(density, linestyle="--", linewidth=0.9, color="#888888")
+            for log_exposure, label in ((estimate.log_ht, "HT"), (estimate.log_hs, "HS")):
+                self.axis.axvline(log_exposure, linestyle=":", linewidth=0.9, color="#c0392b")
+                self.axis.annotate(label, (log_exposure, 0.0), xytext=(2, 2), textcoords="offset points", color="#c0392b")
         self.axis.errorbar(
             result.x_values,
             result.y_values,
@@ -305,17 +405,22 @@ class MainWindow(ttk.Frame):
                 ),
             )
 
-    def _update_summary(self, result: AnalysisResult) -> None:
+    def _update_summary(self, result: AnalysisResult, estimate: IsoRangeEstimate | None = None) -> None:
         if result.reference_mode == "relative":
             reference_text = f"density above brightest step (signal {result.reference_value:.0f})"
         else:
             reference_text = f"calibrated, valid up to D {self._calibration.max_density:.2f}"
-        self.summary_label.config(
-            text=(
-                f"{len(result.measurements)} equal cells along the strip. "
-                f"Reference: {reference_text}."
+        lines = [f"{len(result.measurements)} equal cells along the strip. Reference: {reference_text}."]
+        if estimate is None:
+            lines.append("Effective R estimate (ISO 6846 endpoints): refused, see status bar.")
+        else:
+            iso_text = f"R{estimate.iso_range}" if estimate.iso_range is not None else "outside table 2"
+            dmin_text = "from unexposed patch" if estimate.dmin_source == "supplied" else "estimated from plateau"
+            lines.append(
+                f"Effective R estimate (ISO 6846 endpoints): {iso_text}, LER {estimate.ler:.2f} "
+                f"(raw {estimate.raw_r:.1f}), Dmin {estimate.dmin:.2f} ({dmin_text}), Dmax {estimate.dmax:.2f}."
             )
-        )
+        self.summary_label.config(text="\n".join(lines))
 
     def _clear_results(self) -> None:
         self.results_table.delete(*self.results_table.get_children())
@@ -326,3 +431,4 @@ class MainWindow(ttk.Frame):
         state = "normal" if self._loaded_image is not None and self._selection is not None else "disabled"
         self.analyze_button.config(state=state)
         self.calibrate_button.config(state=state)
+        self.patch_button.config(state=state)

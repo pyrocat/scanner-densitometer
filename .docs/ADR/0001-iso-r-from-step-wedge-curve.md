@@ -1,6 +1,6 @@
 # ADR 0001: Estimate effective ISO(R) from the step-wedge curve
 
-- Status: proposed (second revision after review)
+- Status: accepted, implemented 2026-09-03 (`densitometer/logic/sensitometry.py`, `tests/test_sensitometry.py`)
 - Date: 2026-09-03
 
 ## Context
@@ -112,13 +112,15 @@ Findings:
    dataclass: Dmin and its source (supplied or estimated), Dmax, HT and HS
    as log exposures, LER to two decimals with the tie rule above, raw
    100 × LER, the table 2 class or none, plateau step counts, and warnings.
-   Inside: sort by exposure; PAVA monotone fit; Dmin from the supplied
-   reading when given, else the mean of the light plateau (flatness 0.02 D)
-   labelled as estimated; Dmax from the dark plateau mean; crossings at
+   Inside: sort by exposure; plateaus (flatness 0.02 D) judged on the
+   measured densities, never on the monotone fit, which would pool a still
+   rising end into a false plateau; Dmin from the supplied reading when
+   given, else the light plateau mean labelled as estimated; Dmax from the
+   dark plateau mean; PAVA monotone fit for the crossings only; crossings at
    Dmin + 0.04 and Dmin + 0.90 (Dmax − Dmin) by monotone cubic
    interpolation. NumPy only.
-2. Refuse, rather than warn, when any step is clipped at scanner white or
-   clamped by the calibration range, when the dark plateau has fewer than
+2. Refuse, rather than warn, when any step or the unexposed patch is
+   clipped at scanner white or black or clamped by the calibration range, when the dark plateau has fewer than
    two steps, when Dmin is not supplied and the light plateau has fewer
    than two steps, or when a crossing is not bracketed. The analysis result
    gains a per-step flag for clipped and clamped readings so this check is

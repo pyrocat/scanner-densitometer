@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`densitometer/` is the application package. `app.py` and `__main__.py` provide the Tkinter entry points; `logic/` contains image loading, data models, and the NumPy-based step-wedge analysis; and `ui/` contains the main window and canvas widgets. Keep numerical and image-processing behavior in `logic/` so it remains testable without starting the GUI. Tests live in `tests/`, currently centered on `tests/test_analysis.py`. `img/` holds sample/reference imagery, while `pyproject.toml` and `poetry.lock` define the Python 3.10+ Poetry environment.
+`densitometer/` is the application package. `app.py` and `__main__.py` provide the Tkinter entry points; `logic/` contains image loading, data models, the NumPy-based step-wedge analysis, and the ISO(R) estimate (`sensitometry.py`, see `.docs/ADR/0001-iso-r-from-step-wedge-curve.md`); and `ui/` contains the main window and canvas widgets. Keep numerical and image-processing behavior in `logic/` so it remains testable without starting the GUI. Tests live in `tests/` (`test_analysis.py`, `test_sensitometry.py`). `img/` holds sample/reference imagery, while `pyproject.toml` and `poetry.lock` define the Python 3.10+ Poetry environment.
 
 ## Build, Test, and Development Commands
 

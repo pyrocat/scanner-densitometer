@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .models import (
+    BLACK_LEVEL,
     CLIP_LEVEL,
     T2115_DENSITIES,
     AnalysisResult,
@@ -67,6 +68,7 @@ def analyze_selection(
     ) / 2.0
     # The densest wedge step passes the least light and defines zero exposure.
     log_exposures = wedge[-1] - wedge
+    clipped_cells, clamped_cells = flag_signals(mid, settings)
 
     measurements = tuple(
         StepMeasurement(
@@ -77,21 +79,22 @@ def analyze_selection(
             density_spread=float(spreads[index]),
             relative_log_exposure=float(log_exposures[index]),
             wedge_density=float(wedge[index]),
+            clipped=bool(clipped_cells[cells[index]]),
+            clamped=bool(clamped_cells[cells[index]]),
         )
         for index, step in enumerate(range(1, len(wedge) + 1))
     )
 
     warnings: list[str] = []
-    clipped = int(np.sum(mid >= CLIP_LEVEL))
+    clipped = int(clipped_cells.sum())
     if clipped:
-        warnings.append(f"{clipped} step(s) clipped at scanner white; reduce scanner exposure.")
-    if settings.calibration is not None:
-        beyond = int(np.sum(mid < settings.calibration.min_signal))
-        if beyond:
-            warnings.append(
-                f"{beyond} step(s) darker than the calibration can resolve "
-                f"(reported as D {settings.calibration.max_density:.2f})."
-            )
+        warnings.append(f"{clipped} step(s) clipped at scanner white or black; adjust scanner exposure.")
+    clamped = int(clamped_cells.sum())
+    if clamped:
+        warnings.append(
+            f"{clamped} step(s) outside the calibration range "
+            f"(clamped to D {settings.calibration.table()[1][-1]:.2f} to {settings.calibration.max_density:.2f})."
+        )
 
     return AnalysisResult(
         selection=selection,
@@ -121,13 +124,52 @@ def calibrate_from_wedge(
         known density.
     """
     wedge = tuple(float(value) for value in wedge_densities)
+    if len(wedge) < 3 or not all(np.isfinite(wedge)) or any(np.diff(wedge) <= 0):
+        raise ValueError("Target densities must be at least three finite values, strictly increasing.")
     crop = extract_strip(image, selection, len(wedge))
     mid = measure_cells(crop, equal_boundaries(crop.shape[1], len(wedge)))[1]
     # The wedge itself transmits least through step 21, so its dark end is
     # the high-density end; the opposite of a sample exposed through it.
     if mid[:3].mean() < mid[-3:].mean():
         mid = mid[::-1]
-    return Calibration(signals=tuple(float(value) for value in mid), densities=wedge)
+    calibration = Calibration(signals=tuple(float(value) for value in mid), densities=wedge)
+    if calibration.usable_steps < 2:
+        raise ValueError("Calibration failed: fewer than two target steps are unclipped and distinct.")
+    return calibration
+
+
+def flag_signals(signals: np.ndarray, settings: AnalysisSettings) -> tuple[np.ndarray, np.ndarray]:
+    """Flag signals the density mapping cannot represent.
+
+    Args:
+        signals: Median scanner signals.
+        settings: Supplies the reference mode and calibration.
+
+    Returns:
+        Two boolean arrays: clipped at scanner white or black, and outside the
+        calibration range (always false in relative mode).
+    """
+    signals = np.asarray(signals, dtype=np.float64)
+    clipped = (signals >= CLIP_LEVEL) | (signals < BLACK_LEVEL)
+    clamped = np.zeros_like(clipped)
+    if settings.reference_mode == "calibrated" and settings.calibration is not None:
+        calibration = settings.calibration
+        clamped = (signals < calibration.min_signal) | (signals > calibration.max_signal)
+    return clipped, clamped
+
+
+def measure_patch(image: np.ndarray, selection: Selection) -> float:
+    """Median signal of a uniform patch, such as unexposed processed paper.
+
+    Args:
+        image: Two-dimensional luminance image.
+        selection: Strip covering only the patch; it may be short.
+
+    Returns:
+        The median signal, to be converted with the same density mapping as
+        the sample it accompanies.
+    """
+    return float(np.median(extract_strip(image, selection, 1)))
 
 
 def extract_strip(image: np.ndarray, selection: Selection, step_count: int) -> np.ndarray:

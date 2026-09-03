@@ -18,6 +18,8 @@ T2115_DENSITIES: tuple[float, ...] = tuple(round(0.05 + 0.15 * index, 2) for ind
 
 # Signals within 2% of 16-bit full scale are treated as clipped by the scanner.
 CLIP_LEVEL = 0.98 * 65535.0
+# Signals below one count carry no density information (clipped at black).
+BLACK_LEVEL = 1.0
 
 # ``relative`` reports density above the brightest step (base + fog or paper
 # white); ``calibrated`` maps signal through a scanned target of known density.
@@ -160,6 +162,11 @@ class Calibration:
         return float(10 ** self.table()[0][0])
 
     @property
+    def max_signal(self) -> float:
+        """Brightest signal the map can still resolve; brighter samples clamp."""
+        return float(10 ** self.table()[0][-1])
+
+    @property
     def max_density(self) -> float:
         """Highest density the map can report; darker samples clamp to it."""
         return float(self.table()[1][0])
@@ -200,6 +207,9 @@ class StepMeasurement:
             values indicate dust, texture, or a cell straddling a step edge.
         relative_log_exposure: Exposure-axis value assigned from wedge spacing.
         wedge_density: Nominal optical density of the corresponding wedge step.
+        clipped: The scanner saturated in this cell, so the signal is a floor.
+        clamped: The signal lies outside the calibration's range, so the
+            density is the nearest end of the calibration table.
     """
 
     step: int
@@ -209,6 +219,8 @@ class StepMeasurement:
     density_spread: float
     relative_log_exposure: float
     wedge_density: float
+    clipped: bool = False
+    clamped: bool = False
 
 
 @dataclass(frozen=True, slots=True)

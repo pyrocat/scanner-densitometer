@@ -69,8 +69,9 @@ For this project, that becomes a simpler desktop workflow:
 - Fixed 21-cell grid from one selection, overlaid on the scan so misalignment is visible.
 - Steps identified by position, with the strip direction detected automatically.
 - Built-in curve plotting for relative log exposure versus measured density, with per-step noise bars.
-- A relative mode (density above the brightest step) and a calibrated mode built from a scan of the wedge.
-- Warnings for clipped steps and for samples darker than the calibration can resolve.
+- A relative mode (density above the brightest step) and a calibrated mode built from a scan of any target with known step densities (T2115 nominal or certificate values, or a reflection gray scale such as a Kodak Q-13).
+- Warnings for clipped steps and for samples outside the calibration range.
+- An effective ISO(R) estimate using the ISO 6846 endpoints (HT at Dmin + 0.04, HS at Dmin + 0.90 of the net Dmax), with the endpoints drawn on the plot. Dmin comes from an unexposed patch when one is measured ("Unexposed Patch from Selection"), otherwise from the light plateau. See `.docs/ADR/0001-iso-r-from-step-wedge-curve.md`.
 - Testable logic separated from the Tkinter UI.
 
 ## Assumptions and limitations
@@ -80,6 +81,7 @@ For this project, that becomes a simpler desktop workflow:
 - The strip's centreline must span the 21 steps end to end; the grid is not detected, only divided. Check the overlaid cell lines and the ±D column.
 - A calibration is only valid for scans made with the same scanner, light path (transmission or reflection), and locked exposure. Scanning the wedge alongside the sample is the safest workflow.
 - Calibrating with the T2115 covers transmission scans. Reflection prints get relative densities unless a reflection step tablet is used as the calibration target.
+- The ISO(R) figure is an estimate, not an ISO range: the scanner meets none of the standard's densitometry conditions. It is refused when any step is clipped or clamped, when the curve does not reach Dmax, or when Dmin is neither measured nor visible as a plateau. In relative mode scanner flare biases it low; soft papers need the unexposed-patch reading.
 - Relative mode assumes a linear scanner with no black offset, so it compresses high densities; treat it as approximate.
 - The plotted x-axis is relative log exposure derived from the T2115 spacing, not enlarger time in seconds.
 
