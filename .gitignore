@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-.jpg
+*.jpg
 .idea/**
+*.webp
+*.tif
