@@ -2,7 +2,7 @@
 
 Tkinter app for using a flatbed scanner as a practical densitometer surrogate when analyzing prints made with a Stouffer T2115 21-step wedge.
 
-The app does not talk to the scanner directly. It assumes the scan has already been made and saved as a 16-bit TIFF. The workflow is:
+The app does not talk to the scanner directly. It assumes the scan has already been made and saved as a 16-bit TIFF. TIFFs are decoded from their own tags (bit depth, photometric interpretation, channel layout) so 16-bit RGB scans keep their precision. The workflow is:
 
 1. Open a TIFF scan.
 2. Optionally drag a strip over a scan of the T2115 itself and click
@@ -13,6 +13,11 @@ The app does not talk to the scanner directly. It assumes the scan has already b
    stretch it, a side handle to set the width, or its inside to move it. The
    app divides the strip into 21 equal cells, because the T2115 geometry is
    fixed, measures the centre of each cell, and plots the curve.
+4. Optionally select an unexposed, processed patch and click **Unexposed
+   Patch from Selection** (Dmin), and one or more overexposed patches with
+   **Overexposed Patch from Selection**, entering each patch's log exposure
+   beyond wedge step 1. The patches establish Dmax; without them the
+   wedge-only Dmax is reported as a provisional lower bound.
 
 ## Why this approach
 
@@ -70,29 +75,31 @@ For this project, that becomes a simpler desktop workflow:
 - Steps identified by position, with the strip direction detected automatically.
 - Built-in curve plotting for relative log exposure versus measured density, with per-step noise bars.
 - A relative mode (density above the brightest step) and a calibrated mode built from a scan of any target with known step densities (T2115 nominal or certificate values, or a reflection gray scale such as a Kodak Q-13).
-- Warnings for clipped steps and for samples outside the calibration range.
-- An effective ISO(R) estimate using the ISO 6846 endpoints (HT at Dmin + 0.04, HS at Dmin + 0.90 of the net Dmax), with the endpoints drawn on the plot. Dmin comes from an unexposed patch when one is measured ("Unexposed Patch from Selection"), otherwise from the light plateau. See `.docs/ADR/0001-iso-r-from-step-wedge-curve.md`.
+- Warnings for clipped steps and for samples outside the calibration range; selections that leave the image are refused rather than padded.
+- An effective ISO(R) estimate using the ISO 6846 endpoints (HT at Dmin + 0.04, HS at Dmin + 0.90 of the net Dmax), with the endpoints drawn on the plot. Dmin comes from an unexposed patch when one is measured ("Unexposed Patch from Selection"), otherwise from the light plateau. Dmax comes from the dark plateau, extended by overexposed patches, and is labelled established or provisional. See `.docs/ADR/0001-iso-r-from-step-wedge-curve.md` and `.docs/ADR/0003-iso-r-validity-checks.md`.
 - Testable logic separated from the Tkinter UI.
 
 ## Assumptions and limitations
 
 - Best results require a linear 16-bit TIFF with scanner corrections disabled. Calibrated mode also works with gamma-encoded scans, because the calibration absorbs any monotonic encoding.
-- The app supports grayscale TIFFs directly and also accepts RGB TIFFs by converting them to luminance.
+- The app supports unsigned 8- and 16-bit grayscale and RGB TIFFs (RGB is converted to luminance of the linear samples; WhiteIsZero files are inverted). Palette, CMYK, YCbCr, floating-point and signed TIFFs are refused. Other formats are decoded by Pillow at 8 bits per channel, or 16 bits for grayscale.
 - The strip's centreline must span the 21 steps end to end; the grid is not detected, only divided. Check the overlaid cell lines and the ±D column.
 - A calibration is only valid for scans made with the same scanner, light path (transmission or reflection), and locked exposure. Scanning the wedge alongside the sample is the safest workflow.
 - Calibrating with the T2115 covers transmission scans. Reflection prints get relative densities unless a reflection step tablet is used as the calibration target.
-- The ISO(R) figure is an estimate, not an ISO range: the scanner meets none of the standard's densitometry conditions. It is refused when any step is clipped or clamped, when the curve does not reach Dmax, or when Dmin is neither measured nor visible as a plateau. In relative mode scanner flare biases it low; soft papers need the unexposed-patch reading.
+- The ISO(R) figure is an estimate, not an ISO range: the scanner meets none of the standard's densitometry conditions. It is refused when any step is clipped or clamped, when the curve does not reach Dmax or an overexposed patch shows it still rising, when Dmin is neither measured nor visible as a plateau, when a supplied Dmin contradicts the strip's light end, when the net density is below 0.40 D, or when the monotone fit has to change a step by more than 0.05 D. A wedge-only Dmax is a provisional lower bound until a plateau spans a decade of exposure. In relative mode scanner flare biases it low; soft papers need the unexposed-patch reading.
 - Relative mode assumes a linear scanner with no black offset, so it compresses high densities; treat it as approximate.
 - The plotted x-axis is relative log exposure derived from the T2115 spacing, not enlarger time in seconds.
 
 ## Run
 
+Requires Python 3.12 or later; `poetry install` creates the environment.
+
 ```bash
-python3 -m densitometer
+poetry run densitometer
 ```
 
 ## Test
 
 ```bash
-python3 -m unittest discover -s tests -v
+poetry run python -m unittest discover -s tests -v
 ```

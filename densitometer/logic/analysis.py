@@ -13,11 +13,14 @@ from .models import (
     Calibration,
     Selection,
     StepMeasurement,
+    validate_wedge_densities,
 )
 
 # Fraction of each cell (along the wedge) that is measured. The rest is margin
 # for hand-drawn selections that do not line up with the step edges exactly.
 CELL_FILL = 0.5
+# Cells compared at each end of the strip to decide which end is darker.
+DIRECTION_WINDOW = 3
 
 
 def analyze_selection(
@@ -41,22 +44,33 @@ def analyze_selection(
         order, and data-quality warnings.
 
     Raises:
-        ValueError: If the selection is too small or calibrated mode is
-            requested without a calibration.
+        ValueError: If the wedge definition is invalid, the selection is too
+            small or reaches outside the image, its direction cannot be told,
+            or calibrated mode is requested without a calibration.
     """
     settings = settings or AnalysisSettings()
     if settings.reference_mode == "calibrated" and settings.calibration is None:
         raise ValueError("Calibrated mode needs a calibration. Select the scanned T2115 and calibrate first.")
 
-    wedge = np.asarray(settings.wedge_densities, dtype=np.float64)
-    crop = extract_strip(image, selection, len(wedge))
+    wedge = np.asarray(validate_wedge_densities(settings.wedge_densities), dtype=np.float64)
+    crop, covered = extract_strip(image, selection, len(wedge))
     boundaries = equal_boundaries(crop.shape[1], len(wedge))
+    require_coverage(covered, boundaries)
     low, mid, high = measure_cells(crop, boundaries)
 
+    warnings: list[str] = []
     # Whatever was exposed through the wedge is darkest behind its thinnest
     # step, so the low-signal end of the strip is wedge step 1.
-    reversed_strip = mid[:3].mean() > mid[-3:].mean()
-    cells = np.arange(len(wedge))[::-1] if reversed_strip else np.arange(len(wedge))
+    dark_first = dark_end_is_first(mid)
+    if dark_first is None:
+        if np.ptp(mid) > 0:
+            raise ValueError(
+                "Cannot tell which end of the strip is darker: both ends measure the same signal. "
+                "Check that the selection runs along the wedge from end to end."
+            )
+        dark_first = True
+        warnings.append("Every cell measures the same signal; the strip shows no wedge.")
+    cells = np.arange(len(wedge)) if dark_first else np.arange(len(wedge))[::-1]
 
     reference_value = None if settings.reference_mode == "calibrated" else float(max(mid.max(), 1.0))
     densities = signal_to_density(mid[cells], settings, reference_value)
@@ -85,7 +99,6 @@ def analyze_selection(
         for index, step in enumerate(range(1, len(wedge) + 1))
     )
 
-    warnings: list[str] = []
     clipped = int(clipped_cells.sum())
     if clipped:
         warnings.append(f"{clipped} step(s) clipped at scanner white or black; adjust scanner exposure.")
@@ -122,20 +135,51 @@ def calibrate_from_wedge(
     Returns:
         A :class:`Calibration` pairing each step's median signal with its
         known density.
+
+    Raises:
+        ValueError: If the target definition is invalid, the selection reaches
+            outside the image, the target's direction cannot be told, or fewer
+            than two steps are usable.
     """
-    wedge = tuple(float(value) for value in wedge_densities)
-    if len(wedge) < 3 or not all(np.isfinite(wedge)) or any(np.diff(wedge) <= 0):
-        raise ValueError("Target densities must be at least three finite values, strictly increasing.")
-    crop = extract_strip(image, selection, len(wedge))
-    mid = measure_cells(crop, equal_boundaries(crop.shape[1], len(wedge)))[1]
-    # The wedge itself transmits least through step 21, so its dark end is
-    # the high-density end; the opposite of a sample exposed through it.
-    if mid[:3].mean() < mid[-3:].mean():
+    wedge = validate_wedge_densities(wedge_densities)
+    crop, covered = extract_strip(image, selection, len(wedge))
+    boundaries = equal_boundaries(crop.shape[1], len(wedge))
+    require_coverage(covered, boundaries)
+    mid = measure_cells(crop, boundaries)[1]
+    # The wedge itself transmits least through its last step, so its dark end
+    # is the high-density end; the opposite of a sample exposed through it.
+    dark_first = dark_end_is_first(mid)
+    if dark_first is None and np.ptp(mid) > 0:
+        raise ValueError(
+            "Cannot tell which end of the target is darker: both ends measure the same signal. "
+            "Check that the selection runs along the target from end to end."
+        )
+    if dark_first:
         mid = mid[::-1]
     calibration = Calibration(signals=tuple(float(value) for value in mid), densities=wedge)
     if calibration.usable_steps < 2:
         raise ValueError("Calibration failed: fewer than two target steps are unclipped and distinct.")
     return calibration
+
+
+def dark_end_is_first(signals: np.ndarray) -> bool | None:
+    """Tell which end of a strip is darker from non-overlapping end windows.
+
+    Args:
+        signals: Median signal of each cell along the strip.
+
+    Returns:
+        ``True`` if the first cells are darker than the last, ``False`` if the
+        last are darker, ``None`` if both windows measure the same signal.
+        The windows hold up to ``DIRECTION_WINDOW`` cells but never overlap,
+        so short targets compare their two ends rather than the same cells.
+    """
+    signals = np.asarray(signals, dtype=np.float64)
+    window = max(1, min(DIRECTION_WINDOW, len(signals) // 2))
+    first, last = float(signals[:window].mean()), float(signals[-window:].mean())
+    if first == last:
+        return None
+    return first < last
 
 
 def flag_signals(signals: np.ndarray, settings: AnalysisSettings) -> tuple[np.ndarray, np.ndarray]:
@@ -147,7 +191,8 @@ def flag_signals(signals: np.ndarray, settings: AnalysisSettings) -> tuple[np.nd
 
     Returns:
         Two boolean arrays: clipped at scanner white or black, and outside the
-        calibration range (always false in relative mode).
+        calibration range (always false in relative mode). Signals equal to a
+        calibration anchor are inside the range.
     """
     signals = np.asarray(signals, dtype=np.float64)
     clipped = (signals >= CLIP_LEVEL) | (signals < BLACK_LEVEL)
@@ -168,11 +213,17 @@ def measure_patch(image: np.ndarray, selection: Selection) -> float:
     Returns:
         The median signal, to be converted with the same density mapping as
         the sample it accompanies.
+
+    Raises:
+        ValueError: If the selection is too small or reaches outside the image.
     """
-    return float(np.median(extract_strip(image, selection, 1)))
+    crop, covered = extract_strip(image, selection, 1)
+    if not covered.all():
+        raise ValueError("The patch selection extends outside the image; move it fully inside.")
+    return float(np.median(crop))
 
 
-def extract_strip(image: np.ndarray, selection: Selection, step_count: int) -> np.ndarray:
+def extract_strip(image: np.ndarray, selection: Selection, step_count: int) -> tuple[np.ndarray, np.ndarray]:
     """Resample the (possibly rotated) strip so the wedge runs along axis 1.
 
     Nearest-neighbour sampling keeps every value an actual scanner reading;
@@ -184,8 +235,11 @@ def extract_strip(image: np.ndarray, selection: Selection, step_count: int) -> n
         step_count: Number of cells the strip must be able to hold.
 
     Returns:
-        An array of shape ``(width, length)`` with the first end of the
-        centreline at column zero. Samples outside the image repeat its edge.
+        Two arrays of shape ``(width, length)`` with the first end of the
+        centreline at column zero: the sampled values, and a boolean mask that
+        is ``True`` where the sample lies inside the image. Samples outside
+        the image repeat its edge and are ``False`` in the mask; callers must
+        check the mask before measuring, because edge padding is not data.
 
     Raises:
         ValueError: If the strip is too thin or too short to measure.
@@ -202,9 +256,29 @@ def extract_strip(image: np.ndarray, selection: Selection, step_count: int) -> n
     across = np.arange(width) - (width - 1) / 2.0
     xs = selection.x0 + ux * along[np.newaxis, :] - uy * across[:, np.newaxis]
     ys = selection.y0 + uy * along[np.newaxis, :] + ux * across[:, np.newaxis]
-    rows = np.clip(np.floor(ys).astype(int), 0, image.shape[0] - 1)
-    columns = np.clip(np.floor(xs).astype(int), 0, image.shape[1] - 1)
-    return image[rows, columns]
+    rows = np.floor(ys).astype(int)
+    columns = np.floor(xs).astype(int)
+    covered = (rows >= 0) & (rows < image.shape[0]) & (columns >= 0) & (columns < image.shape[1])
+    crop = image[np.clip(rows, 0, image.shape[0] - 1), np.clip(columns, 0, image.shape[1] - 1)]
+    return crop, covered
+
+
+def require_coverage(covered: np.ndarray, boundaries: np.ndarray) -> None:
+    """Refuse a selection whose measured cell regions reach outside the image.
+
+    Args:
+        covered: Mask from :func:`extract_strip`.
+        boundaries: Cell boundaries from :func:`equal_boundaries`.
+
+    Raises:
+        ValueError: Naming the one-based cells (in strip order) that are not
+            fully inside the image.
+    """
+    missing = [index + 1 for index, cell in enumerate(cell_slices(boundaries)) if not covered[:, cell].all()]
+    if missing:
+        raise ValueError(
+            f"Cell(s) {missing} of the selection extend outside the image; move the selection so every step is inside."
+        )
 
 
 def equal_boundaries(length: int, step_count: int) -> np.ndarray:
@@ -229,6 +303,19 @@ def equal_boundaries(length: int, step_count: int) -> np.ndarray:
     return boundaries
 
 
+def cell_slices(boundaries: np.ndarray) -> list[slice]:
+    """Return the measured part of each cell along the wedge axis.
+
+    Only the central ``CELL_FILL`` fraction of a cell is measured; the margin
+    absorbs selections that do not line up with the step edges exactly.
+    """
+    slices = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        margin = int((end - start) * (1.0 - CELL_FILL) / 2.0)
+        slices.append(slice(int(start) + margin, int(end) - margin))
+    return slices
+
+
 def measure_cells(crop: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
     """Measure the central part of each cell along the wedge axis.
 
@@ -241,10 +328,7 @@ def measure_cells(crop: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
         signal of each cell. The median is robust to dust and step numerals;
         the outer percentiles measure the noise around it.
     """
-    percentiles = []
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        margin = int((end - start) * (1.0 - CELL_FILL) / 2.0)
-        percentiles.append(np.percentile(crop[:, start + margin : end - margin], [16, 50, 84]))
+    percentiles = [np.percentile(crop[:, cell], [16, 50, 84]) for cell in cell_slices(boundaries)]
     return np.array(percentiles, dtype=np.float64).T
 
 

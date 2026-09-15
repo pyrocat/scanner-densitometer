@@ -9,9 +9,11 @@ from densitometer.logic.analysis import (
     analyze_selection,
     calibrate_from_wedge,
     equal_boundaries,
+    flag_signals,
+    measure_patch,
     signal_to_density,
 )
-from densitometer.logic.models import AnalysisSettings, Selection
+from densitometer.logic.models import AnalysisSettings, Calibration, Selection, validate_wedge_densities
 
 CELL = 18
 HEIGHT = 40
@@ -134,6 +136,113 @@ class AnalysisTests(unittest.TestCase):
         calibration = calibrate_from_wedge(wedge_image, whole_strip(wedge_image))
         self.assertEqual(calibration.usable_steps, 16)
         self.assertAlmostEqual(calibration.max_density, T2115_DENSITIES[17], places=6)
+
+
+class CalibrationTests(unittest.TestCase):
+    def test_black_clipped_anchors_are_not_usable(self) -> None:
+        calibration = Calibration(signals=(1000.0, 0.0, 0.0), densities=(0.05, 0.20, 0.35))
+        self.assertEqual(calibration.usable_steps, 1)
+        image = make_strip(np.array([1000.0] + [0.0] * 20))
+        with self.assertRaisesRegex(ValueError, "fewer than two"):
+            calibrate_from_wedge(image, whole_strip(image))
+
+    def test_sub_one_count_anchors_do_not_duplicate_coordinates(self) -> None:
+        self.assertEqual(Calibration(signals=(1000.0, 0.5, 0.2), densities=(0.05, 0.20, 0.35)).usable_steps, 1)
+        calibration = Calibration(signals=(1000.0, 100.0, 1.0, 0.5), densities=(0.05, 0.20, 0.35, 0.50))
+        log_signals, densities = calibration.table()
+        self.assertEqual(calibration.usable_steps, 3)
+        self.assertTrue(np.all(np.diff(log_signals) > 0))
+        self.assertAlmostEqual(calibration.max_density, 0.35)
+        self.assertEqual(calibration.min_signal, 1.0)
+
+    def test_nonfinite_anchors_are_skipped_without_blocking_darker_steps(self) -> None:
+        calibration = Calibration(signals=(1000.0, float("nan"), 100.0), densities=(0.05, 0.20, 0.35))
+        self.assertEqual(calibration.usable_steps, 2)
+        self.assertAlmostEqual(calibration.max_density, 0.35)
+        self.assertEqual(Calibration(signals=(1000.0, 100.0), densities=(0.05, float("inf"))).usable_steps, 1)
+
+    def test_measured_anchor_bounds_are_exact(self) -> None:
+        calibration = Calibration(signals=(50000.0, 5000.0, 500.0), densities=(0.1, 1.1, 2.1))
+        self.assertEqual(calibration.max_signal, 50000.0)
+        self.assertEqual(calibration.min_signal, 500.0)
+        settings = AnalysisSettings(reference_mode="calibrated", calibration=calibration)
+        clipped, clamped = flag_signals(np.array([50000.0, 500.0, 50000.5, 499.9]), settings)
+        self.assertEqual(clamped.tolist(), [False, False, True, True])
+        self.assertFalse(clipped.any())
+        self.assertTrue(np.allclose(calibration.apply(np.array([50000.0, 500.0])), [0.1, 2.1]))
+
+    def test_sample_equal_to_the_brightest_anchor_is_not_clamped(self) -> None:
+        wedge_signals = gamma_scanner(np.array(T2115_DENSITIES))
+        wedge_image = make_strip(wedge_signals)
+        calibration = calibrate_from_wedge(wedge_image, whole_strip(wedge_image))
+        settings = AnalysisSettings(reference_mode="calibrated", calibration=calibration)
+        result = analyze_selection(wedge_image, whole_strip(wedge_image), settings)
+        self.assertFalse(any(m.clamped for m in result.measurements))
+        self.assertTrue(np.allclose(result.y_values, np.array(T2115_DENSITIES)[::-1], atol=1e-9))
+        self.assertEqual(result.warnings, ())
+
+
+class CoverageAndOrientationTests(unittest.TestCase):
+    def test_selection_reaching_outside_the_image_is_refused(self) -> None:
+        image = make_strip(np.linspace(54000, 1800, 21))
+        width = float(image.shape[1])
+        # Issue 4: 36 pixels beyond the edge used to become three repeated dark cells.
+        with self.assertRaisesRegex(ValueError, r"Cell\(s\) \[20, 21\] .* outside the image"):
+            analyze_selection(image, Selection(0.0, HEIGHT / 2, width + 36.0, HEIGHT / 2, float(HEIGHT)))
+        # Only the unmeasured margin of the last cell is outside: still measurable.
+        result = analyze_selection(image, Selection(0.0, HEIGHT / 2, width + 3.0, HEIGHT / 2, float(HEIGHT)))
+        self.assertEqual(len(result.measurements), 21)
+        # A strip wider than the image reaches outside along its whole length.
+        with self.assertRaisesRegex(ValueError, "outside the image"):
+            analyze_selection(image, Selection(0.0, HEIGHT / 2, width, HEIGHT / 2, HEIGHT + 4.0))
+        with self.assertRaisesRegex(ValueError, "outside the image"):
+            calibrate_from_wedge(image, Selection(0.0, HEIGHT / 2, width + 36.0, HEIGHT / 2, float(HEIGHT)))
+
+    def test_patch_selection_must_be_inside_the_image(self) -> None:
+        image = make_strip(np.full(21, 30000.0))
+        self.assertAlmostEqual(measure_patch(image, Selection(2.0, HEIGHT / 2, 40.0, HEIGHT / 2, 20.0)), 30000.0)
+        with self.assertRaisesRegex(ValueError, "outside the image"):
+            measure_patch(image, Selection(-10.0, HEIGHT / 2, 40.0, HEIGHT / 2, 20.0))
+
+    def test_three_step_targets_orient_by_their_ends(self) -> None:
+        # Issue 10: three-cell windows overlapped completely for three-step targets.
+        values = np.array([54000.0, 20000.0, 5000.0])
+        wedge = (0.05, 0.50, 1.00)
+        for image in (make_strip(values), make_strip(values[::-1])):
+            result = analyze_selection(image, whole_strip(image), AnalysisSettings(wedge_densities=wedge))
+            self.assertEqual([m.step for m in result.measurements], [1, 2, 3])
+            self.assertAlmostEqual(result.measurements[0].signal, 5000.0)
+            self.assertAlmostEqual(result.measurements[-1].density, 0.0)
+        calibrations = [calibrate_from_wedge(img, whole_strip(img), wedge) for img in (make_strip(values), make_strip(values[::-1]))]
+        self.assertEqual(calibrations[0], calibrations[1])
+        self.assertEqual(calibrations[0].usable_steps, 3)
+        self.assertEqual(calibrations[0].signals[0], 54000.0)
+
+    def test_undetermined_direction_is_refused_or_flagged(self) -> None:
+        symmetric = make_strip(np.array([1000.0] * 3 + [5000.0] * 15 + [1000.0] * 3))
+        with self.assertRaisesRegex(ValueError, "Cannot tell which end"):
+            analyze_selection(symmetric, whole_strip(symmetric))
+        with self.assertRaisesRegex(ValueError, "Cannot tell which end"):
+            calibrate_from_wedge(symmetric, whole_strip(symmetric))
+        uniform = make_strip(np.full(21, 30000.0))
+        result = analyze_selection(uniform, whole_strip(uniform))
+        self.assertTrue(any("same signal" in w for w in result.warnings))
+        with self.assertRaisesRegex(ValueError, "fewer than two"):
+            calibrate_from_wedge(uniform, whole_strip(uniform))
+
+    def test_wedge_definition_is_validated_on_every_path(self) -> None:
+        # Issue 11: analysis accepted what calibration rejected, and NaN slipped through.
+        image = make_strip(np.linspace(54000, 1800, 21))
+        for wedge in ((0.1, 0.2), (0.1, 0.2, 0.2), (0.1, float("nan"), 0.3), (0.3, 0.2, 0.1)):
+            with self.assertRaisesRegex(ValueError, "strictly increasing", msg=str(wedge)):
+                analyze_selection(image, whole_strip(image), AnalysisSettings(wedge_densities=wedge))
+            with self.assertRaisesRegex(ValueError, "strictly increasing", msg=str(wedge)):
+                calibrate_from_wedge(image, whole_strip(image), wedge)
+            with self.assertRaises(ValueError, msg=str(wedge)):
+                validate_wedge_densities(wedge)
+        with self.assertRaisesRegex(ValueError, "numbers"):
+            validate_wedge_densities(("a", "b", "c"))
+        self.assertEqual(validate_wedge_densities(["0.1", 0.2, 0.3]), (0.1, 0.2, 0.3))
 
 
 class SelectionTests(unittest.TestCase):

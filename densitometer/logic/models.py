@@ -25,6 +25,40 @@ BLACK_LEVEL = 1.0
 # white); ``calibrated`` maps signal through a scanned target of known density.
 ReferenceMode = Literal["relative", "calibrated"]
 
+# Fewest steps a wedge or calibration target may have: the exposure axis and
+# the orientation heuristic need distinct ends and at least one step between.
+MIN_WEDGE_STEPS = 3
+
+
+def validate_wedge_densities(values) -> tuple[float, ...]:
+    """Check a wedge or target definition shared by analysis, calibration and UI.
+
+    Args:
+        values: Density of each step, step 1 (lightest) first.
+
+    Returns:
+        The densities as a tuple of floats.
+
+    Raises:
+        ValueError: If there are fewer than ``MIN_WEDGE_STEPS`` values, any is
+            not a finite number, or they are not strictly increasing. A
+            strictly increasing finite wedge makes every exposure axis derived
+            from it finite with distinct coordinates.
+    """
+    try:
+        densities = tuple(float(value) for value in values)
+    except (TypeError, ValueError):
+        raise ValueError("Wedge densities must be numbers.") from None
+    if (
+        len(densities) < MIN_WEDGE_STEPS
+        or not all(math.isfinite(density) for density in densities)
+        or any(later <= earlier for earlier, later in zip(densities, densities[1:]))
+    ):
+        raise ValueError(
+            f"Wedge densities must be at least {MIN_WEDGE_STEPS} finite values, strictly increasing."
+        )
+    return densities
+
 @dataclass(frozen=True, slots=True)
 class LoadedImage:
     """Hold source metadata and the two prepared image representations.
@@ -40,6 +74,10 @@ class LoadedImage:
         width: Width of ``analysis_image`` in pixels.
         height: Height of ``analysis_image`` in pixels.
         full_scale: Nominal maximum signal for the normalized image data.
+        bits_per_sample: Declared bit depth of the source samples; the
+            analysis data was scaled from this range, never from content.
+        photometric: Name of the photometric interpretation applied while
+            decoding (``"MinIsBlack"``, ``"MinIsWhite"`` or ``"RGB"``).
     """
 
     path: Path
@@ -50,6 +88,8 @@ class LoadedImage:
     width: int
     height: int
     full_scale: float = 65535.0
+    bits_per_sample: int = 16
+    photometric: str = "MinIsBlack"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,44 +177,59 @@ class Calibration:
     signals: tuple[float, ...]
     densities: tuple[float, ...]
 
-    def table(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return usable ``(log10 signal, density)`` pairs, ascending in signal.
+    def usable(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return usable ``(signal, density)`` pairs, ascending in signal.
 
-        Steps that are clipped, or whose signal is not below every lighter
-        step, are dropped: beyond the scanner's own flare floor the signal
-        flattens and cannot be inverted into density.
+        A step is usable when its reading is finite, unclipped at scanner
+        white and black, and below every lighter usable step: beyond the
+        scanner's flare floor the signal flattens and cannot be inverted into
+        density, and a black-clipped reading carries no density information.
+        Usable signals are therefore distinct and at least one count, so their
+        logarithms are distinct interpolation coordinates.
         """
         signals = np.asarray(self.signals, dtype=np.float64)
         densities = np.asarray(self.densities, dtype=np.float64)
-        lighter_minimum = np.minimum.accumulate(np.concatenate(([np.inf], signals[:-1])))
-        keep = (signals < lighter_minimum) & (signals < CLIP_LEVEL)
-        log_signals = np.log10(np.clip(signals[keep], 1.0, None))
-        return log_signals[::-1], densities[keep][::-1]
+        finite = np.isfinite(signals) & np.isfinite(densities)
+        # Unreadable steps must not block darker ones, so they do not enter
+        # the running minimum of the lighter steps.
+        lighter = np.where(finite, signals, np.inf)
+        lighter_minimum = np.minimum.accumulate(np.concatenate(([np.inf], lighter[:-1])))
+        keep = finite & (signals >= BLACK_LEVEL) & (signals < CLIP_LEVEL) & (signals < lighter_minimum)
+        return signals[keep][::-1], densities[keep][::-1]
+
+    def table(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return usable ``(log10 signal, density)`` pairs, ascending in signal."""
+        signals, densities = self.usable()
+        return np.log10(signals), densities
 
     @property
     def usable_steps(self) -> int:
         """Number of target steps that contribute to the map."""
-        return len(self.table()[0])
+        return len(self.usable()[0])
 
     @property
     def min_signal(self) -> float:
-        """Darkest signal the map can still resolve."""
-        return float(10 ** self.table()[0][0])
+        """Darkest signal the map can still resolve, as measured."""
+        return float(self.usable()[0][0])
 
     @property
     def max_signal(self) -> float:
-        """Brightest signal the map can still resolve; brighter samples clamp."""
-        return float(10 ** self.table()[0][-1])
+        """Brightest signal the map can still resolve, as measured; brighter samples clamp."""
+        return float(self.usable()[0][-1])
 
     @property
     def max_density(self) -> float:
         """Highest density the map can report; darker samples clamp to it."""
-        return float(self.table()[1][0])
+        return float(self.usable()[1][0])
 
     def apply(self, signals: np.ndarray) -> np.ndarray:
-        """Map scanner signals to density by interpolating in log signal."""
+        """Map scanner signals to density by interpolating in log signal.
+
+        Signals outside the usable range take the density of the nearest
+        end; ``flag_signals`` marks such samples as clamped.
+        """
         log_signals, densities = self.table()
-        return np.interp(np.log10(np.clip(signals, 1.0, None)), log_signals, densities)
+        return np.interp(np.log10(np.clip(signals, BLACK_LEVEL, None)), log_signals, densities)
 
 
 @dataclass(frozen=True, slots=True)

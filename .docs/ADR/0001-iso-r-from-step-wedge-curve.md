@@ -1,6 +1,7 @@
 # ADR 0001: Estimate effective ISO(R) from the step-wedge curve
 
-- Status: accepted, implemented 2026-09-03 (`densitometer/logic/sensitometry.py`, `tests/test_sensitometry.py`)
+- Status: accepted, implemented 2026-09-03 (`densitometer/logic/sensitometry.py`, `tests/test_sensitometry.py`);
+  validity checks, overexposed-patch Dmax evidence and a production benchmark added by ADR 0003 (2026-09-16)
 - Date: 2026-09-03
 
 ## Context
@@ -104,6 +105,16 @@ Findings:
 - Table 2 misclassification is inherent near band edges (a true LER of
   1.37 sits 0.02 from the R130/R140 boundary), so the raw value must be
   shown alongside the class.
+
+Scope of these tables (added 2026-09-16): the benchmark above judges
+plateaus on the fitted curve and never refuses, whereas the application
+judges them on the raw readings and refuses short plateaus. The noiseless,
+flare and wedge-tolerance rows reproduce through the application within
+0.1 R. The noisy rows do not include the application's refusals: with Dmin
+supplied it refuses 0.2 to 0.8 % of trials at 0.005 D and 13 to 19 % at
+0.01 D, with estimated Dmin 0.4 to 3.4 % and 25 to 33 %. ADR 0003 tabulates
+the production estimator, including refusals, and supersedes the noisy rows
+here.
 
 ## Decision
 
